@@ -57,6 +57,7 @@ pub fn main(init: std.process.Init) !void {
 
     const allocator = init.arena.allocator();
     const argv = try init.minimal.args.toSlice(allocator);
+    
 
     const opts = args_mod.parse(argv[1..]) catch {
         try errw.writeAll("error: invalid arguments\n\n");
@@ -108,6 +109,7 @@ fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.I
     var refs = refs_mod.readAll(allocator, &repo) catch {
         return fail(errw, exit_general, "error: failed to read refs");
     };
+
 
     if (opts.verbose) {
         const elapsed_ms = start_ts.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds();
@@ -171,9 +173,11 @@ fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.I
         },
     }
 
+
     if (opts.verbose) {
         const elapsed_ms = start_ts.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds();
-        errw.print("verbose: total {d} ms\n", .{elapsed_ms}) catch {};
+        const ru = std.posix.getrusage(0);
+        errw.print("verbose: total {d} ms, peak RSS {d} KB\n", .{ elapsed_ms, @divTrunc(ru.maxrss, 1024) }) catch {};
     }
     return exit_success;
 }

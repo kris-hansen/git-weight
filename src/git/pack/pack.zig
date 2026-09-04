@@ -181,12 +181,13 @@ pub const Pack = struct {
         return self.index.offsetAt(i);
     }
 
-    /// Inflate the (decompressed) delta stream for the entry at `offset`.
-    fn inflateDeltaStream(self: *const Pack, allocator: std.mem.Allocator, info: ObjectInfo) PackError![]u8 {
-        var in = Io.Reader.fixed(self.data[@intCast(info.data_offset)..]);
+    /// Inflate the decompressed delta instruction stream for the entry at
+    /// `offset`. `stream_size` is the entry's declared (decompressed) size.
+    fn inflateDeltaStream(self: *const Pack, allocator: std.mem.Allocator, data_offset: u64, stream_size: u64) PackError![]u8 {
+        var in = Io.Reader.fixed(self.data[@intCast(data_offset)..]);
         var window: [std.compress.flate.max_window_len]u8 = undefined;
-    var decomp = std.compress.flate.Decompress.init(&in, .zlib, &window);
-        const buf = allocator.alloc(u8, @intCast(info.size)) catch return error.OutOfMemory;
+        var decomp = std.compress.flate.Decompress.init(&in, .zlib, &window);
+        const buf = allocator.alloc(u8, @intCast(stream_size)) catch return error.OutOfMemory;
         errdefer allocator.free(buf);
         // Delta entries: entry size is the decompressed delta stream length.
         decomp.reader.readSliceAll(buf) catch return error.CorruptPack;
@@ -211,7 +212,7 @@ pub const Pack = struct {
             .commit, .tree, .blob, .tag => {
                 var in = Io.Reader.fixed(self.data[@intCast(raw.data_offset)..]);
                 var window: [std.compress.flate.max_window_len]u8 = undefined;
-    var decomp = std.compress.flate.Decompress.init(&in, .zlib, &window);
+                var decomp = std.compress.flate.Decompress.init(&in, .zlib, &window);
                 const buf = allocator.alloc(u8, @intCast(raw.size)) catch return error.OutOfMemory;
                 errdefer allocator.free(buf);
                 decomp.reader.readSliceAll(buf) catch return error.CorruptPack;
@@ -221,14 +222,7 @@ pub const Pack = struct {
                 const base_offset = try self.baseOffset(raw.base);
                 const base = try self.readPayloadDepth(allocator, base_offset, depth + 1);
                 defer allocator.free(base.data);
-                const info = ObjectInfo{
-                    .object_type = base.object_type,
-                    .size = 0,
-                    .offset = offset,
-                    .data_offset = raw.data_offset,
-                    .delta_base = raw.base,
-                };
-                const stream = try self.inflateDeltaStream(allocator, info);
+                const stream = try self.inflateDeltaStream(allocator, raw.data_offset, raw.size);
                 defer allocator.free(stream);
                 const out = delta.applyDelta(allocator, base.data, stream) catch return error.CorruptPack;
                 return .{ .object_type = base.object_type, .data = out };

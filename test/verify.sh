@@ -181,6 +181,66 @@ for t in ("blob", "tree", "commit"):
 print("ok: delta-heavy logical sizes match oracle")
 PYEOF
 
+# --- fixture: delta'd trees (many commits modifying subsets of files) -------
+REPO="$FIXTURES/trees"
+mkdir -p "$REPO"
+cd "$REPO"
+git init -q -b main
+git config user.email test@example.com
+git config user.name Test
+python3 - <<'PYEOF'
+import os, random, subprocess
+random.seed(7)
+p = subprocess.Popen(["git", "fast-import", "--quiet"], stdin=subprocess.PIPE)
+out = p.stdin
+for c in range(300):
+    out.write(b"commit refs/heads/main\n")
+    out.write(f"committer T <t@t> {1700000000+c*60} +0000\n".encode())
+    msg = f"commit {c}\n"
+    out.write(f"data {len(msg)}\n".encode() + msg.encode())
+    for f in sorted(random.sample(range(40), 8)):
+        content = os.urandom(random.choice([300, 2000, 8000]))
+        path = f"src/file{f:03d}.bin"
+        out.write(f"M 100644 inline {path}\n".encode())
+        out.write(f"data {len(content)}\n".encode() + content + b"\n")
+    out.write(b"\n")
+out.close()
+p.wait()
+assert p.returncode == 0
+PYEOF
+git gc -q
+
+TREE_DELTAS=$(git verify-pack -v .git/objects/pack/*.idx 2>/dev/null | awk 'length($1) == 40 && $2 == "tree" && NF == 7' | wc -l)
+echo "tree-delta fixture: $TREE_DELTAS delta'd trees"
+[ "$TREE_DELTAS" -gt 0 ] || fail "fixture did not produce delta'd trees"
+
+# Every blob must map to a path from the git rev-list oracle.
+"$GW" largest --limit 100000 --json > "$FIXTURES/trees_largest.json"
+python3 - "$FIXTURES/trees_largest.json" <<'PYEOF'
+import json, subprocess, sys
+
+blobs = json.load(open(sys.argv[1]))["blobs"]
+out = subprocess.check_output(
+    ["git", "rev-list", "--objects", "--all"]).decode(errors="replace")
+oid_paths = {}
+for line in out.splitlines():
+    parts = line.split(" ", 1)
+    if len(parts) == 2:
+        oid_paths[parts[0][:7]] = parts[1]
+missing = 0
+for b in blobs:
+    p = b["path"]
+    if p is None or oid_paths.get(b["oid"][:7]) != p:
+        missing += 1
+        if missing <= 3:
+            print(f"bad path: {b['oid'][:7]} tool={p} oracle={oid_paths.get(b['oid'][:7])}",
+                  file=sys.stderr)
+if missing:
+    print(f"FAIL: {missing} blobs with missing/incorrect path", file=sys.stderr)
+    sys.exit(1)
+print(f"ok: {len(blobs)} blob paths match git rev-list oracle (delta'd trees)")
+PYEOF
+
 # --- fixture: loose-only and empty repos --------------------------------------
 REPO="$FIXTURES/loose"
 mkdir -p "$REPO"

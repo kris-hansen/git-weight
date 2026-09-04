@@ -46,8 +46,9 @@ fn peelToCommit(store: *const object_store.ObjectStore, id: *const object_id.Obj
     switch (inf.object_type) {
         .commit => return id.*,
         .tag => {
-            const payload = store.readPayload(store.allocator, id) catch return null;
-            defer store.allocator.free(payload.data);
+            var scratch = std.heap.ArenaAllocator.init(store.allocator);
+            defer scratch.deinit();
+            const payload = store.readPayload(scratch.allocator(), id) catch return null;
             const t = tag_mod.parse(payload.data, id.algorithm) catch return null;
             return peelToCommit(store, &t.object, depth + 1);
         },
@@ -94,7 +95,7 @@ pub fn compute(
         const commit_oid = peelToCommit(store, &r.target, 0) orelse continue;
         if (queued.contains(commit_oid)) continue;
         try queued.put(allocator, commit_oid, {});
-        const time = commitCommitterTime(store, allocator, &commit_oid) orelse 0;
+        const time = commitCommitterTime(store, &commit_oid) orelse 0;
         try queue.push(allocator, .{ .time = time, .id = commit_oid });
     }
 
@@ -104,7 +105,7 @@ pub fn compute(
         const head = refs.refs.items[refs.refs.items.len - 1];
         if (std.mem.eql(u8, head.name, "HEAD")) {
             if (peelToCommit(store, &head.target, 0)) |head_commit| {
-                if (headTree(store, allocator, &head_commit)) |tree_oid| {
+                if (headTree(store, &head_commit)) |tree_oid| {
                     var prefix: std.ArrayList(u8) = .empty;
                     defer prefix.deinit(arena);
                     walkTree(store, &map, &tree_oid, &prefix, null, true, 0) catch |err| switch (err) {
@@ -126,11 +127,13 @@ pub fn compute(
         if (visited.contains(pc.id)) continue;
         try visited.put(allocator, pc.id, {});
 
-        const payload = store.readPayload(allocator, &pc.id) catch continue;
-        defer allocator.free(payload.data);
+        var scratch = std.heap.ArenaAllocator.init(allocator);
+        defer scratch.deinit();
+        const payload = store.readPayload(scratch.allocator(), &pc.id) catch {
+            continue;
+        };
         if (payload.object_type != .commit) continue;
-        const c = commit_mod.parse(payload.data, pc.id.algorithm, allocator) catch continue;
-        defer allocator.free(c.parents);
+        const c = commit_mod.parse(payload.data, pc.id.algorithm, scratch.allocator()) catch continue;
 
         {
             var prefix: std.ArrayList(u8) = .empty;
@@ -144,7 +147,7 @@ pub fn compute(
         for (c.parents) |p| {
             if (visited.contains(p) or queued.contains(p)) continue;
             try queued.put(allocator, p, {});
-            const time = commitCommitterTime(store, allocator, &p) orelse 0;
+            const time = commitCommitterTime(store, &p) orelse 0;
             try queue.push(allocator, .{ .time = time, .id = p });
         }
     }
@@ -152,22 +155,22 @@ pub fn compute(
     return map;
 }
 
-fn commitCommitterTime(store: *const object_store.ObjectStore, allocator: std.mem.Allocator, commit_oid: *const object_id.ObjectId) ?i64 {
-    const payload = store.readPayload(allocator, commit_oid) catch return null;
-    defer allocator.free(payload.data);
+fn commitCommitterTime(store: *const object_store.ObjectStore, commit_oid: *const object_id.ObjectId) ?i64 {
+    var scratch = std.heap.ArenaAllocator.init(store.allocator);
+    defer scratch.deinit();
+    const payload = store.readPayload(scratch.allocator(), commit_oid) catch return null;
     if (payload.object_type != .commit) return null;
-    const c = commit_mod.parse(payload.data, commit_oid.algorithm, allocator) catch return null;
-    defer allocator.free(c.parents);
+    const c = commit_mod.parse(payload.data, commit_oid.algorithm, scratch.allocator()) catch return null;
     if (c.committer) |cm| return cm.timestamp;
     return null;
 }
 
-fn headTree(store: *const object_store.ObjectStore, allocator: std.mem.Allocator, commit_oid: *const object_id.ObjectId) !object_id.ObjectId {
-    const payload = try store.readPayload(allocator, commit_oid);
-    defer allocator.free(payload.data);
+fn headTree(store: *const object_store.ObjectStore, commit_oid: *const object_id.ObjectId) !object_id.ObjectId {
+    var scratch = std.heap.ArenaAllocator.init(store.allocator);
+    defer scratch.deinit();
+    const payload = try store.readPayload(scratch.allocator(), commit_oid);
     if (payload.object_type != .commit) return error.CorruptRepository;
-    const c = try commit_mod.parse(payload.data, commit_oid.algorithm, allocator);
-    defer allocator.free(c.parents);
+    const c = try commit_mod.parse(payload.data, commit_oid.algorithm, scratch.allocator());
     return c.tree;
 }
 
@@ -193,8 +196,9 @@ fn walkTree(
         try pt.put(store.allocator, tree_oid.*, {});
     }
 
-    const payload = store.readPayload(store.allocator, tree_oid) catch return;
-    defer store.allocator.free(payload.data);
+    var scratch = std.heap.ArenaAllocator.init(store.allocator);
+    defer scratch.deinit();
+    const payload = store.readPayload(scratch.allocator(), tree_oid) catch return;
     if (payload.object_type != .tree) return;
 
     const base_len = prefix.items.len;
