@@ -154,7 +154,7 @@ Benchmarks with [hyperfine](https://github.com/sharkdp/hyperfine) (mean of 10+ r
 | `changed` | `git diff --quiet` (16ms) | 9ms | **1.7× faster** |
 | `packs` | `git verify-pack` (71s) | 388ms | **184× faster** |
 
-Known gaps, being honest about them: `largest` trails the `git rev-list --objects --all | git cat-file --batch-check` pipeline (~2–3× on large repos) and `explain` trails `git log --all -- <path>` — though both plumbing commands compute strictly less (no physical sizes, retention, or reachability). Closing those is the roadmap:
+Known gaps: `largest` trails the `git rev-list --objects --all | git cat-file --batch-check` pipeline (~2–3× on large repos) and `explain` trails `git log --all -- <path>` — though both plumbing commands compute strictly less (no physical sizes, retention, or reachability). Closing those is the roadmap:
 
 - **v1.0 worker-pool parallelism** — git-sizer already parallelizes; git-weight is currently single-threaded (`--threads` is accepted but ignored).
 - **Zero-copy payload reads** — borrowed cache entries instead of copy-on-hit.
