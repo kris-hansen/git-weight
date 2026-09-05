@@ -34,11 +34,18 @@ pub const ObjectInfo = struct {
 
 const max_delta_depth = 4096;
 
+fn orderU64(a: u64, b: u64) std.math.Order {
+    return std.math.order(a, b);
+}
+
 /// A packfile plus its index, both memory-mapped.
 pub const Pack = struct {
     data: []const u8,
     index: PackIndex,
     oid_len: usize,
+    /// All entry offsets, sorted ascending; enables O(log n) nextOffsetAfter.
+    /// Owned by the ObjectStore that built it; empty means "not built".
+    sorted_offsets: []const u64 = &.{},
 
     /// Raw entry header as stored in the pack.
     const RawEntry = struct {
@@ -149,7 +156,7 @@ pub const Pack = struct {
             .ofs_delta, .ref_delta => {
                 const base_offset = try self.baseOffset(raw.base);
                 const base_info = try self.infoAtDepth(base_offset, depth + 1);
-                const tgt_size = try self.deltaTargetSize(raw.data_offset, raw.size);
+                const tgt_size = try self.deltaTargetSize(raw.data_offset);
                 return .{
                     .object_type = base_info.object_type,
                     .size = tgt_size,
@@ -161,13 +168,75 @@ pub const Pack = struct {
         }
     }
 
+    /// Resolved pack entry infos keyed by entry offset.
+    pub const InfoCache = std.AutoHashMapUnmanaged(u64, ObjectInfo);
+
+    /// Like `infoAt`, but iterative and memoized: every chain entry resolved
+    /// along the way is cached, so resolving all entries in a pack costs one
+    /// header read (and one partial inflate) per delta entry total.
+    pub fn infoAtCached(self: *const Pack, cache: *InfoCache, allocator: std.mem.Allocator, offset: u64) PackError!ObjectInfo {
+        if (cache.get(offset)) |inf| return inf;
+
+        var chain: std.ArrayList(u64) = .empty;
+        defer chain.deinit(allocator);
+
+        var base_info: ObjectInfo = undefined;
+        var cur = offset;
+        walk: while (true) {
+            if (cache.get(cur)) |inf| {
+                base_info = inf;
+                break :walk;
+            }
+            const raw = try self.readRawEntry(cur);
+            switch (raw.entry_type) {
+                .commit, .tree, .blob, .tag => {
+                    base_info = .{
+                        .object_type = raw.entry_type,
+                        .size = raw.size,
+                        .offset = cur,
+                        .data_offset = raw.data_offset,
+                        .delta_base = .none,
+                    };
+                    break :walk;
+                },
+                .ofs_delta, .ref_delta => {
+                    if (chain.items.len >= max_delta_depth) return error.CorruptPack;
+                    try chain.append(allocator, cur);
+                    cur = try self.baseOffset(raw.base);
+                },
+            }
+        }
+
+        if (chain.items.len == 0) return base_info;
+        try cache.put(allocator, cur, base_info);
+
+        // Unwind deepest-first: each delta's logical size comes from its own
+        // stream header; the type propagates up from the base.
+        var resolved = base_info;
+        var i = chain.items.len;
+        while (i > 0) {
+            i -= 1;
+            const entry_off = chain.items[i];
+            const raw = try self.readRawEntry(entry_off);
+            const tgt_size = try self.deltaTargetSize(raw.data_offset);
+            resolved = .{
+                .object_type = resolved.object_type,
+                .size = tgt_size,
+                .offset = entry_off,
+                .data_offset = raw.data_offset,
+                .delta_base = raw.base,
+            };
+            try cache.put(allocator, entry_off, resolved);
+        }
+        return resolved;
+    }
+
     /// Inflate just enough of the delta stream at `data_offset` to read the
     /// source and target size varints.
-    fn deltaTargetSize(self: *const Pack, data_offset: u64, delta_size: u64) PackError!u64 {
-        _ = delta_size;
+    fn deltaTargetSize(self: *const Pack, data_offset: u64) PackError!u64 {
         var in = Io.Reader.fixed(self.data[@intCast(data_offset)..]);
         var window: [std.compress.flate.max_window_len]u8 = undefined;
-    var decomp = std.compress.flate.Decompress.init(&in, .zlib, &window);
+        var decomp = std.compress.flate.Decompress.init(&in, .zlib, &window);
         var buf: [32]u8 = undefined;
         const n = decomp.reader.readSliceShort(&buf) catch return error.CorruptPack;
         var pos: usize = 0;
@@ -185,7 +254,12 @@ pub const Pack = struct {
     /// offset of the trailing pack checksum if none. Used to derive an
     /// entry's physical (on-disk) span.
     pub fn nextOffsetAfter(self: *const Pack, offset: u64) u64 {
-        var next: u64 = self.data.len - self.oid_len; // trailing pack checksum
+        const end: u64 = self.data.len - self.oid_len; // trailing pack checksum
+        if (self.sorted_offsets.len > 0) {
+            const idx = std.sort.upperBound(u64, self.sorted_offsets, offset, orderU64);
+            return if (idx < self.sorted_offsets.len) self.sorted_offsets[idx] else end;
+        }
+        var next: u64 = end;
         var i: usize = 0;
         while (i < self.index.count) : (i += 1) {
             const o = self.index.offsetAt(i);
@@ -212,14 +286,69 @@ pub const Pack = struct {
         data: []u8,
     };
 
+    /// Cache of reconstructed payloads by pack offset (the equivalent of
+    /// git's delta base cache). When `total_bytes` exceeds `budget` the whole
+    /// cache is cleared — delta chains are resolved and consumed in one
+    /// burst, so chain-local reuse (the common case) survives clearing while
+    /// per-insert eviction bookkeeping is avoided entirely. Entries larger
+    /// than `max_entry_size` are never cached. Owns all cached bytes.
+    pub const PayloadCache = struct {
+        pub const Entry = struct {
+            object_type: git_object.ObjectType,
+            data: []u8,
+        };
+
+        allocator: std.mem.Allocator,
+        map: std.AutoHashMapUnmanaged(u64, Entry) = .empty,
+        total_bytes: u64 = 0,
+        budget: u64 = 128 << 20,
+
+        const max_entry_size = 4 << 20;
+
+        pub fn deinit(self: *PayloadCache) void {
+            var it = self.map.iterator();
+            while (it.next()) |e| self.allocator.free(e.value_ptr.data);
+            self.map.deinit(self.allocator);
+        }
+
+        fn get(self: *const PayloadCache, offset: u64) ?Entry {
+            return self.map.get(offset);
+        }
+
+        fn put(self: *PayloadCache, offset: u64, object_type: git_object.ObjectType, data: []const u8) void {
+            if (data.len > max_entry_size) return;
+            if (self.map.contains(offset)) return;
+            if (self.total_bytes + data.len > self.budget) {
+                var it = self.map.iterator();
+                while (it.next()) |e| self.allocator.free(e.value_ptr.data);
+                self.map.clearRetainingCapacity();
+                self.total_bytes = 0;
+            }
+            const copy = self.allocator.dupe(u8, data) catch return;
+            self.map.put(self.allocator, offset, .{ .object_type = object_type, .data = copy }) catch {
+                self.allocator.free(copy);
+                return;
+            };
+            self.total_bytes += copy.len;
+        }
+    };
+
     /// Fully reconstruct the object payload at `offset`. Payloads are
-    /// decompressed and delta-resolved; caller owns the memory.
-    pub fn readPayload(self: *const Pack, allocator: std.mem.Allocator, offset: u64) PackError!Payload {
-        return self.readPayloadDepth(allocator, offset, 0);
+    /// decompressed and delta-resolved; caller owns the memory. When `cache`
+    /// is given, reconstructed entries (including delta bases) are memoized
+    /// so repeated walks pay one inflation per object.
+    pub fn readPayload(self: *const Pack, allocator: std.mem.Allocator, offset: u64, cache: ?*PayloadCache) PackError!Payload {
+        return self.readPayloadDepth(allocator, offset, cache, 0);
     }
 
-    fn readPayloadDepth(self: *const Pack, allocator: std.mem.Allocator, offset: u64, depth: usize) PackError!Payload {
+    fn readPayloadDepth(self: *const Pack, allocator: std.mem.Allocator, offset: u64, cache: ?*PayloadCache, depth: usize) PackError!Payload {
         if (depth > max_delta_depth) return error.CorruptPack;
+        if (cache) |c| {
+            if (c.get(offset)) |cached| {
+                const dupe = allocator.dupe(u8, cached.data) catch return error.OutOfMemory;
+                return .{ .object_type = cached.object_type, .data = dupe };
+            }
+        }
         const raw = try self.readRawEntry(offset);
         switch (raw.entry_type) {
             .commit, .tree, .blob, .tag => {
@@ -229,15 +358,17 @@ pub const Pack = struct {
                 const buf = allocator.alloc(u8, @intCast(raw.size)) catch return error.OutOfMemory;
                 errdefer allocator.free(buf);
                 decomp.reader.readSliceAll(buf) catch return error.CorruptPack;
+                if (cache) |c| c.put(offset, raw.entry_type, buf);
                 return .{ .object_type = raw.entry_type, .data = buf };
             },
             .ofs_delta, .ref_delta => {
                 const base_offset = try self.baseOffset(raw.base);
-                const base = try self.readPayloadDepth(allocator, base_offset, depth + 1);
+                const base = try self.readPayloadDepth(allocator, base_offset, cache, depth + 1);
                 defer allocator.free(base.data);
                 const stream = try self.inflateDeltaStream(allocator, raw.data_offset, raw.size);
                 defer allocator.free(stream);
                 const out = delta.applyDelta(allocator, base.data, stream) catch return error.CorruptPack;
+                if (cache) |c| c.put(offset, base.object_type, out);
                 return .{ .object_type = base.object_type, .data = out };
             },
         }

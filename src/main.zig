@@ -23,6 +23,30 @@ pub const exit_not_found: ExitCode = 3;
 pub const exit_unsupported: ExitCode = 4;
 pub const exit_corrupt: ExitCode = 5;
 
+/// Phase timer for `--verbose`: each mark prints the delta since the
+/// previous mark and the cumulative total.
+const Timer = struct {
+    io: std.Io,
+    errw: *std.Io.Writer,
+    start: std.Io.Timestamp,
+    last: std.Io.Timestamp,
+    enabled: bool,
+
+    fn init(io: std.Io, errw: *std.Io.Writer, enabled: bool) Timer {
+        const now = std.Io.Timestamp.now(io, .awake);
+        return .{ .io = io, .errw = errw, .start = now, .last = now, .enabled = enabled };
+    }
+
+    fn mark(self: *Timer, comptime fmt: []const u8, args: anytype) void {
+        if (!self.enabled) return;
+        const now = std.Io.Timestamp.now(self.io, .awake);
+        const delta = self.last.durationTo(now).toMilliseconds();
+        const total = self.start.durationTo(now).toMilliseconds();
+        self.last = now;
+        self.errw.print("verbose: " ++ fmt ++ " {d} ms (total {d} ms)\n", args ++ .{ delta, total }) catch {};
+    }
+};
+
 comptime {
     // Reference all modules so `zig build test` compiles and runs their tests.
     _ = @import("cli/args.zig");
@@ -98,7 +122,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.Io.Writer, opts: *const args_mod.Options) ExitCode {
-    const start_ts = std.Io.Timestamp.now(io, .awake);
+    var timer = Timer.init(io, errw, opts.verbose);
 
     const start_path = opts.repo_path orelse ".";
     var repo = repository.discover(allocator, start_path) catch |err| switch (err) {
@@ -120,13 +144,21 @@ fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.I
         return fail(errw, exit_general, "error: failed to read refs");
     };
 
+    // `changed` resolves only a handful of objects; every other command
+    // enumerates the object database, so build the full index up front.
+    if (opts.command != .changed) {
+        store.ensureIndexed() catch |err| switch (err) {
+            error.OutOfMemory, error.SystemResources => return fail(errw, exit_general, "error: out of memory"),
+            error.UnsupportedFormat => return fail(errw, exit_unsupported, "error: unsupported Git format"),
+            error.CorruptRepository => return fail(errw, exit_corrupt, "error: corrupt repository"),
+            else => return fail(errw, exit_general, "error: failed to read object database"),
+        };
+    }
 
-    if (opts.verbose) {
-        const elapsed_ms = start_ts.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds();
-        errw.print("verbose: opened store with {d} objects in {d} ms\n", .{
-            store.objectCount(),
-            elapsed_ms,
-        }) catch {};
+    if (store.indexed) {
+        timer.mark("open: {d} objects, {d} refs in", .{ store.objectCount(), refs.refs.items.len });
+    } else {
+        timer.mark("open: lazy index, {d} refs in", .{refs.refs.items.len});
     }
 
     switch (opts.command) {
@@ -134,6 +166,7 @@ fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.I
             const s = summary.build(allocator, &repo, &store, &refs) catch |err| {
                 return reportAnalysisError(errw, err);
             };
+            timer.mark("analysis: summary in", .{});
             if (opts.json) {
                 var jw: json.JsonWriter = .{ .w = w };
                 json.printSummary(&jw, &s) catch return exit_general;
@@ -149,9 +182,11 @@ fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.I
             var path_map = paths.compute(&store, &refs, allocator) catch {
                 return fail(errw, exit_general, "error: failed to resolve paths");
             };
+            timer.mark("paths: {d} blob paths in", .{path_map.paths.count()});
             const entries = largest.topBlobs(&store, &path_map, allocator, opts.limit, opts.min_size, filter) catch {
                 return fail(errw, exit_general, "error: failed to analyze blobs");
             };
+            timer.mark("analysis: largest in", .{});
             if (opts.json) {
                 var jw: json.JsonWriter = .{ .w = w };
                 json.printLargest(&jw, entries) catch return exit_general;
@@ -163,6 +198,7 @@ fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.I
             const stats = objects.computeStats(&store) catch {
                 return fail(errw, exit_general, "error: failed to analyze objects");
             };
+            timer.mark("analysis: objects in", .{});
             if (opts.json) {
                 var jw: json.JsonWriter = .{ .w = w };
                 json.printObjects(&jw, &stats) catch return exit_general;
@@ -174,6 +210,7 @@ fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.I
             const list = packs.listPacks(&store, allocator) catch {
                 return fail(errw, exit_general, "error: failed to analyze packs");
             };
+            timer.mark("analysis: packs in", .{});
             if (opts.json) {
                 var jw: json.JsonWriter = .{ .w = w };
                 json.printPacks(&jw, list) catch return exit_general;
@@ -185,6 +222,7 @@ fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.I
             var stats = reachability.unreachableStats(&store, &refs, allocator) catch |err| {
                 return reportAnalysisError(errw, err);
             };
+            timer.mark("analysis: unreachable in", .{});
             if (opts.json) {
                 var jw: json.JsonWriter = .{ .w = w };
                 json.printUnreachable(&jw, &stats) catch return exit_general;
@@ -196,6 +234,7 @@ fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.I
             const weights = refs_analysis.uniqueWeights(&store, &refs, allocator, opts.limit) catch |err| {
                 return reportAnalysisError(errw, err);
             };
+            timer.mark("analysis: refs in", .{});
             if (opts.json) {
                 var jw: json.JsonWriter = .{ .w = w };
                 json.printRefs(&jw, weights) catch return exit_general;
@@ -211,6 +250,7 @@ fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.I
                 return fail(errw, exit_general, "error: failed to resolve paths");
             };
             defer path_map.deinit();
+            timer.mark("paths: {d} blob paths in", .{path_map.paths.count()});
             const resolved = explain_mod.resolveTarget(&store, &path_map, target) catch |err| switch (err) {
                 error.NotFound => {
                     errw.print("error: path not found in repository history: {s}\n", .{target}) catch {};
@@ -226,10 +266,12 @@ fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.I
                     return exit_invalid_args;
                 },
             };
+            timer.mark("resolve: target in", .{});
             var report = explain_mod.build(&store, &refs, &path_map, id, allocator) catch |err| {
                 return reportAnalysisError(errw, err);
             };
             defer report.deinit(allocator);
+            timer.mark("analysis: explain in", .{});
             if (opts.json) {
                 var jw: json.JsonWriter = .{ .w = w };
                 json.printExplain(&jw, target, &report) catch return exit_general;
@@ -257,6 +299,7 @@ fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.I
                     return exit_invalid_args;
                 },
             };
+            timer.mark("resolve: revisions in", .{});
             const report = changed_mod.compare(&store, path, base_name, base_commit, to_name, to_commit, allocator) catch |err| switch (err) {
                 error.PathNotFound => {
                     errw.print("error: path not found in either revision: {s}\n", .{path}) catch {};
@@ -265,6 +308,7 @@ fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.I
                 error.OutOfMemory => return fail(errw, exit_general, "error: out of memory"),
                 else => return reportAnalysisError(errw, err),
             };
+            timer.mark("analysis: changed in", .{});
             if (opts.json) {
                 var jw: json.JsonWriter = .{ .w = w };
                 json.printChanged(&jw, &report) catch return exit_general;
@@ -275,11 +319,9 @@ fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.I
         },
     }
 
-
     if (opts.verbose) {
-        const elapsed_ms = start_ts.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds();
         const ru = std.posix.getrusage(0);
-        errw.print("verbose: total {d} ms, peak RSS {d} KB\n", .{ elapsed_ms, @divTrunc(ru.maxrss, 1024) }) catch {};
+        errw.print("verbose: peak RSS {d} KB\n", .{@divTrunc(ru.maxrss, 1024)}) catch {};
     }
     return exit_success;
 }

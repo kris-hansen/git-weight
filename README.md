@@ -2,15 +2,9 @@
 
 **Find out what's weighing down your Git repository.**
 
-`git-weight` is a fast, standalone CLI for Git repository storage forensics.
-It parses Git storage formats directly — packfiles, pack indexes, loose
-objects, refs — with no dependency on the Git executable, Python, or any
-other runtime. It is a read-only tool: it never modifies packs, refs, or the
-working tree.
+`git-weight` is a fast, standalone CLI for Git repository storage forensics. It parses Git storage formats directly — packfiles, pack indexes, loose objects, refs — with no dependency on the Git executable, Python, or any other runtime. It is a read-only tool: it never modifies packs, refs, or the working tree.
 
-Unlike `git-sizer` (which identifies structural characteristics that make a
-repository awkward to work with), `git-weight` explains where repository
-storage is going and why that storage is still retained.
+Unlike `git-sizer` (which identifies structural characteristics that make a repository awkward to work with), `git-weight` explains where repository storage is going and why that storage is still retained.
 
 ## Install
 
@@ -20,8 +14,7 @@ Build from source with [Zig](https://ziglang.org) 0.16+:
 zig build -Doptimize=ReleaseFast
 ```
 
-The binary is named `git-weight`, so Git can invoke it as a subcommand when
-it is on your `$PATH`:
+The binary is named `git-weight`, so Git can invoke it as a subcommand when it is on your `$PATH`:
 
 ```sh
 git weight          # same as git-weight
@@ -104,8 +97,7 @@ Run:
 
 ### Change detection for CI
 
-`git weight changed` compares the tree (or blob) hash of a path between two
-revisions — a native, `git`-free `git diff --quiet` for automation:
+`git weight changed` compares the tree (or blob) hash of a path between two revisions — a native, `git`-free `git diff --quiet` for automation:
 
 ```sh
 # Rebuild services/api only if it changed since the base branch.
@@ -116,12 +108,7 @@ else
 fi
 ```
 
-`--base` defaults to `HEAD~1` and `--to` to `HEAD`; both accept ref names,
-full hex oids, and ancestry suffixes (`~N`, `^N`, e.g. `HEAD~2^1`).
-Annotated tags are peeled to their commits. With `--json`, each side is
-reported as `{"ref": ..., "commit": ..., "tree": ...}`, where `tree` holds
-the subtree or blob oid at the path (null when the path is absent on that
-side).
+`--base` defaults to `HEAD~1` and `--to` to `HEAD`; both accept ref names, full hex oids, and ancestry suffixes (`~N`, `^N`, e.g. `HEAD~2^1`). Annotated tags are peeled to their commits. With `--json`, each side is reported as `{"ref": ..., "commit": ..., "tree": ...}`, where `tree` holds the subtree or blob oid at the path (null when the path is absent on that side).
 
 ### Terminology
 
@@ -144,24 +131,49 @@ side).
 | 4    | unsupported Git format|
 | 5    | corrupt repository    |
 
+## Performance
+
+git-weight aims to be the fastest way to interrogate a Git repository. It reads packfiles, indexes, loose objects, and refs directly — no `git` subprocess, no runtime — memory-mapped I/O, memoized delta-chain resolution, a delta-base payload cache, and lazy indexing so cheap commands (`changed`) never pay for a full object scan.
+
+Benchmarks with [hyperfine](https://github.com/sharkdp/hyperfine) (mean of 10+ runs; 2 runs for the huge repo), Apple Silicon, `zig build -Doptimize=ReleaseFast`. Reproduce with `test/bench.sh REPO LABEL PATH`.
+
+**comanda** — 22MB `.git`, 6.6k objects, 544 refs:
+
+| benchmark | alternative | git-weight | result |
+|---|---|---|---|
+| `summary` | git-sizer (229ms) | 154ms | **1.5× faster** |
+| `changed` | `git diff --quiet` (11ms) | 8ms | **1.4× faster** |
+| `packs` | `git verify-pack` (143ms) | 17ms | **8.2× faster** |
+| `unreachable` | `git fsck --unreachable` (229ms) | 129ms | **1.8× faster** |
+
+**homebrew-core** — 949MB `.git`, 2.5M objects, 595k commits:
+
+| benchmark | alternative | git-weight | result |
+|---|---|---|---|
+| `summary` | git-sizer (165s) | 121s | **1.4× faster** |
+| `changed` | `git diff --quiet` (16ms) | 9ms | **1.7× faster** |
+| `packs` | `git verify-pack` (71s) | 388ms | **184× faster** |
+
+Known gaps, being honest about them: `largest` trails the `git rev-list --objects --all | git cat-file --batch-check` pipeline (~2–3× on large repos) and `explain` trails `git log --all -- <path>` — though both plumbing commands compute strictly less (no physical sizes, retention, or reachability). Closing those is the roadmap:
+
+- **v1.0 worker-pool parallelism** — git-sizer already parallelizes; git-weight is currently single-threaded (`--threads` is accepted but ignored).
+- **Zero-copy payload reads** — borrowed cache entries instead of copy-on-hit.
+- **System zlib option** — the pure-Zig inflater trades a little speed for zero dependencies.
+
+Performance is a feature: every command reports per-phase timings and peak RSS with `--verbose`, and regressions are meant to be caught with `test/bench.sh`.
+
 ## Development
 
 ```sh
 zig build          # debug build
 zig build test     # unit tests
 test/verify.sh     # integration checks against Git plumbing (uses git as a test oracle)
+test/bench.sh REPO LABEL PATH [heavy|huge]  # benchmark against git plumbing and git-sizer (needs hyperfine, git-sizer)
 ```
 
 ## Status and roadmap
 
-**v0.3** (current): repository discovery (normal, bare, linked worktrees),
-loose-object scanning, pack index v2 parsing, pack entry metadata, native
-zlib streaming, OFS/REF delta resolution for exact logical sizes, physical
-(on-disk) sizes per object, reachability analysis, `explain` (per-object
-history: introduced/deleted commits, retaining refs, reclaimable estimate),
-`refs` (unique weight per ref) and `unreachable` commands, `changed`
-(tree/blob change detection between revisions, for CI), human-readable
-and JSON output, macOS/Linux.
+**v0.3** (current): repository discovery (normal, bare, linked worktrees), loose-object scanning, pack index v2 parsing, pack entry metadata, native zlib streaming, OFS/REF delta resolution for exact logical sizes, physical (on-disk) sizes per object, reachability analysis, `explain` (per-object history: introduced/deleted commits, retaining refs, reclaimable estimate), `refs` (unique weight per ref) and `unreachable` commands, `changed` (tree/blob change detection between revisions, for CI), human-readable and JSON output, macOS/Linux.
 
 Known limitations:
 
@@ -171,8 +183,7 @@ Known limitations:
 
 Planned:
 
-- **v1.0**: worker-pool parallelism, SHA-256 support, full "why is this
-  still here?" story per spec
+- **v1.0**: worker-pool parallelism, SHA-256 support, full "why is this still here?" story per spec
 
 See `spec.md` (in the project repository) for the full product definition.
 

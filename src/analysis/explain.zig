@@ -5,6 +5,7 @@ const object_store = @import("objects.zig");
 const refs_mod = @import("../git/refs.zig");
 const commit_mod = @import("../git/commit.zig");
 const tree_mod = @import("../git/tree.zig");
+const tag_mod = @import("../git/tag.zig");
 const paths_mod = @import("paths.zig");
 const reachability = @import("reachability.zig");
 
@@ -198,6 +199,11 @@ fn walkCommits(
     var scratch = std.heap.ArenaAllocator.init(arena);
     defer scratch.deinit();
 
+    // Checkpoint-style histories reuse the same tree across many commits;
+    // the presence result depends only on the tree oid.
+    var present_memo: std.HashMapUnmanaged(object_id.ObjectId, bool, object_id.ObjectId.Context, 80) = .empty;
+    defer present_memo.deinit(arena);
+
     while (stack.pop()) |id| {
         _ = scratch.reset(.retain_capacity);
         const payload = store.readPayload(scratch.allocator(), &id) catch continue;
@@ -208,7 +214,11 @@ fn walkCommits(
         // commit payload — intern everything needed first.
         const parents = try arena.dupe(object_id.ObjectId, c.parents);
         const author: ?[]const u8 = if (c.author) |a| try arena.dupe(u8, a.ident) else null;
-        const present = blobPresentAtPath(store, &scratch, &c.tree, comps, want);
+        const present = if (present_memo.get(c.tree)) |p| p else blk: {
+            const p = blobPresentAtPath(store, &scratch, &c.tree, comps, want);
+            try present_memo.put(arena, c.tree, p);
+            break :blk p;
+        };
         try commits.append(arena, .{
             .id = id,
             .time = if (c.committer) |cm| cm.timestamp else 0,
@@ -293,6 +303,10 @@ fn analyzeHistory(
 }
 
 /// Which refs (excluding HEAD) retain `id`, full names sorted alphabetically.
+/// Refs sharing a target oid are walked once; each walk stops as soon as
+/// `id` is found, and objects proven unable to reach `id` are memoized
+/// across walks. Without this, repos with many refs (checkpoint/tooling
+/// namespaces) cost one full graph walk per ref.
 fn retainingRefs(
     store: *const object_store.ObjectStore,
     refs: *const refs_mod.Refs,
@@ -301,15 +315,91 @@ fn retainingRefs(
 ) ExplainError![][]const u8 {
     var names: std.ArrayList([]const u8) = .empty;
     errdefer names.deinit(allocator);
+
+    var by_target: std.HashMapUnmanaged(object_id.ObjectId, std.ArrayList([]const u8), object_id.ObjectId.Context, 80) = .empty;
+    defer {
+        var git = by_target.iterator();
+        while (git.next()) |e| e.value_ptr.deinit(allocator);
+        by_target.deinit(allocator);
+    }
     for (refs.refs.items) |r| {
         if (std.mem.eql(u8, r.name, "HEAD")) continue;
-        var reach = try reachability.computeFromTips(store, &.{r.target}, allocator);
-        defer reach.deinit();
-        if (reach.contains(id)) try names.append(allocator, r.name);
+        const gop = try by_target.getOrPut(allocator, r.target);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(allocator, r.name);
+    }
+
+    var unreachable_from: std.HashMapUnmanaged(object_id.ObjectId, void, object_id.ObjectId.Context, 80) = .empty;
+    defer unreachable_from.deinit(allocator);
+
+    var it = by_target.iterator();
+    while (it.next()) |e| {
+        if (try reachesObject(store, e.key_ptr, id, &unreachable_from, allocator)) {
+            for (e.value_ptr.items) |name| try names.append(allocator, name);
+        }
     }
     const slice = try names.toOwnedSlice(allocator);
     std.mem.sort([]const u8, slice, {}, strLess);
     return slice;
+}
+
+/// Whether `id` is reachable from `tip`. `unreachable_from` memoizes objects
+/// proven — by a walk that completed without finding `id` — to not reach it.
+fn reachesObject(
+    store: *const object_store.ObjectStore,
+    tip: *const object_id.ObjectId,
+    id: *const object_id.ObjectId,
+    unreachable_from: *std.HashMapUnmanaged(object_id.ObjectId, void, object_id.ObjectId.Context, 80),
+    allocator: std.mem.Allocator,
+) ExplainError!bool {
+    var visited: std.HashMapUnmanaged(object_id.ObjectId, void, object_id.ObjectId.Context, 80) = .empty;
+    defer visited.deinit(allocator);
+    var stack: std.ArrayList(object_id.ObjectId) = .empty;
+    defer stack.deinit(allocator);
+    try stack.append(allocator, tip.*);
+
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+
+    const found = found: while (stack.pop()) |oid| {
+        if (oid.eql(id)) break :found true;
+        if (visited.contains(oid)) continue;
+        if (unreachable_from.contains(oid)) continue;
+        try visited.put(allocator, oid, {});
+
+        const inf = store.info(&oid) catch continue;
+        _ = scratch.reset(.retain_capacity);
+        switch (inf.object_type) {
+            .commit => {
+                const payload = store.readPayload(scratch.allocator(), &oid) catch continue;
+                const c = commit_mod.parse(payload.data, oid.algorithm, scratch.allocator()) catch continue;
+                try stack.append(allocator, c.tree);
+                try stack.appendSlice(allocator, c.parents);
+            },
+            .tree => {
+                const payload = store.readPayload(scratch.allocator(), &oid) catch continue;
+                var it = tree_mod.TreeIterator.init(payload.data, oid.algorithm);
+                while (it.next() catch null) |entry| {
+                    switch (entry.entryMode()) {
+                        .tree, .blob, .other => try stack.append(allocator, entry.id),
+                        .submodule => {},
+                    }
+                }
+            },
+            .tag => {
+                const payload = store.readPayload(scratch.allocator(), &oid) catch continue;
+                const t = tag_mod.parse(payload.data, oid.algorithm) catch continue;
+                try stack.append(allocator, t.object);
+            },
+            else => {},
+        }
+    } else false;
+
+    if (!found) {
+        var it = visited.keyIterator();
+        while (it.next()) |k| try unreachable_from.put(allocator, k.*, {});
+    }
+    return found;
 }
 
 fn strLess(_: void, a: []const u8, b: []const u8) bool {
@@ -357,22 +447,35 @@ pub fn build(
 
     const retained_by = try retainingRefs(store, refs, &id, allocator);
 
-    var all = try reachability.computeAll(store, refs, allocator);
-    defer all.deinit();
-    const reachable = all.contains(&id);
-
     // "From HEAD" answers whether the object is part of the current tree:
     // for blobs that is the HEAD-tree membership test; other object types
-    // use plain tip reachability from HEAD.
+    // use plain tip reachability from HEAD. The HEAD walk is computed at
+    // most once and is shared with the fallback reachability check below.
+    var from_head: ?reachability.Reachable = null;
+    defer if (from_head) |*fh| fh.deinit();
+
     var reachable_from_head = false;
     if (inf.object_type == .blob) {
         reachable_from_head = path_map.isCurrent(&id);
     } else if (refs.refs.items.len > 0) {
         const head = refs.refs.items[refs.refs.items.len - 1];
         if (std.mem.eql(u8, head.name, "HEAD")) {
-            var from_head = try reachability.computeFromTips(store, &.{head.target}, allocator);
-            defer from_head.deinit();
-            reachable_from_head = from_head.contains(&id);
+            from_head = try reachability.computeFromTips(store, &.{head.target}, allocator);
+            reachable_from_head = from_head.?.contains(&id);
+        }
+    }
+
+    // Reachable from any ref (including HEAD). retainingRefs covers every
+    // ref except HEAD, so only when nothing retains the object do we need a
+    // HEAD walk — reused from above when it already ran.
+    var reachable = retained_by.len > 0;
+    if (!reachable and refs.refs.items.len > 0) {
+        const head = refs.refs.items[refs.refs.items.len - 1];
+        if (std.mem.eql(u8, head.name, "HEAD")) {
+            if (from_head == null) {
+                from_head = try reachability.computeFromTips(store, &.{head.target}, allocator);
+            }
+            reachable = from_head.?.contains(&id);
         }
     }
 

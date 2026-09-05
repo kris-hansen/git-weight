@@ -80,7 +80,10 @@ pub fn build(
 
     const contributors = try largest_mod.topBlobs(store, &path_map, allocator, 4, 0, .all);
     const historical_bytes = try largest_mod.historicalWeight(store, &path_map);
-    const unreachable_stats = try reachability.unreachableStats(store, refs, allocator);
+    // paths.compute already visited every reachable object; reuse its set
+    // instead of a second full graph walk.
+    const reachable = reachability.Reachable{ .allocator = allocator, .set = path_map.reachable };
+    const unreachable_stats = try reachability.statsFor(store, &reachable);
 
     const name = repoName(allocator, repo) catch try allocator.dupe(u8, "repository");
     const git_dir_path = try allocator.dupe(u8, repo.git_dir);

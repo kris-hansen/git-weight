@@ -13,13 +13,13 @@ pub const LooseError = error{
 
 pub const LooseObject = struct {
     id: object_id.ObjectId,
-    object_type: git_object.ObjectType,
-    /// Logical (uncompressed payload) size from the object header.
-    size: u64,
     /// Physical file size on disk.
     file_size: u64,
     /// Absolute path of the loose object file.
     path: []const u8,
+    /// Lazily resolved object header (type + logical size); null until the
+    /// file is first read via resolveHeader.
+    header: ?git_object.Header,
 };
 
 pub const LooseList = struct {
@@ -48,6 +48,23 @@ pub fn readObjectHeader(data: []const u8) !git_object.Header {
     return parsed.header;
 }
 
+/// Inflate just the header of the loose object file at `path`.
+pub fn readHeaderFromPath(path: []const u8) LooseError!git_object.Header {
+    var mf = mmap.MappedFile.init(path) catch return error.CorruptRepository;
+    defer mf.deinit();
+    return readObjectHeader(mf.data) catch return error.CorruptRepository;
+}
+
+/// Resolve and cache a loose object's header (type + logical size) by
+/// inflating the first bytes of its file. Scanning defers this so startup
+/// cost stays proportional to the objects actually touched.
+pub fn resolveHeader(o: *LooseObject) LooseError!git_object.Header {
+    if (o.header) |h| return h;
+    const h = try readHeaderFromPath(o.path);
+    o.header = h;
+    return h;
+}
+
 fn scanLooseFile(
     allocator: std.mem.Allocator,
     dir_name: []const u8,
@@ -63,19 +80,13 @@ fn scanLooseFile(
     const full_hex = std.fmt.bufPrint(&hex_buf, "{s}{s}", .{ dir_name, file_name }) catch return;
     const id = object_id.ObjectId.fromHex(full_hex) catch return;
 
-    var mf = mmap.MappedFile.init(path) catch return error.CorruptRepository;
-    defer mf.deinit();
-
-    const header = readObjectHeader(mf.data) catch return error.CorruptRepository;
-
     const dup_path = try allocator.dupe(u8, path);
     errdefer allocator.free(dup_path);
     try out.objects.append(allocator, .{
         .id = id,
-        .object_type = header.object_type,
-        .size = header.size,
         .file_size = stat.size,
         .path = dup_path,
+        .header = null,
     });
 }
 
