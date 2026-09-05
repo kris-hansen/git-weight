@@ -40,7 +40,7 @@ pub const PathMap = struct {
 };
 
 /// Peel a ref target (possibly an annotated tag) down to a commit oid.
-fn peelToCommit(store: *const object_store.ObjectStore, id: *const object_id.ObjectId, depth: usize) ?object_id.ObjectId {
+pub fn peelToCommit(store: *const object_store.ObjectStore, id: *const object_id.ObjectId, depth: usize) ?object_id.ObjectId {
     if (depth > 32) return null;
     const inf = store.info(id) catch return null;
     switch (inf.object_type) {

@@ -181,6 +181,19 @@ pub const Pack = struct {
         return self.index.offsetAt(i);
     }
 
+    /// The smallest entry offset in the index greater than `offset`, or the
+    /// offset of the trailing pack checksum if none. Used to derive an
+    /// entry's physical (on-disk) span.
+    pub fn nextOffsetAfter(self: *const Pack, offset: u64) u64 {
+        var next: u64 = self.data.len - self.oid_len; // trailing pack checksum
+        var i: usize = 0;
+        while (i < self.index.count) : (i += 1) {
+            const o = self.index.offsetAt(i);
+            if (o > offset and o < next) next = o;
+        }
+        return next;
+    }
+
     /// Inflate the decompressed delta instruction stream for the entry at
     /// `offset`. `stream_size` is the entry's declared (decompressed) size.
     fn inflateDeltaStream(self: *const Pack, allocator: std.mem.Allocator, data_offset: u64, stream_size: u64) PackError![]u8 {

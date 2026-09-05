@@ -33,16 +33,23 @@ git weight          # same as git-weight
 git weight [COMMAND] [PATH] [OPTIONS]
 
 Commands:
-  summary    High-level repository report (default)
-  largest    Largest blobs in repository history
-  objects    Per-type object counts and logical sizes
-  packs      Packfile statistics
+  summary      High-level repository report (default)
+  largest      Largest blobs in repository history
+  objects      Per-type object counts and logical sizes
+  packs        Packfile statistics
+  explain      Explain why a path or object contributes to repository weight
+  refs         Refs retaining historical weight
+  unreachable  Unreachable objects reclaimable via git gc
+  changed      Whether a path changed between two revisions (CI)
 
 Options:
   --json             Machine-readable JSON output
-  --limit N          Maximum entries to list (default 20)
+  --limit N          Maximum entries to list (default 20; applies to largest/refs)
   --min-size SIZE    Only include blobs at least SIZE (e.g. 10MB, 500KiB)
-  --threads N        Worker thread count (accepted; v0.1 runs single-threaded)
+  --threads N        Worker thread count (accepted; currently single-threaded)
+  --base REF         Base revision for 'changed' (default HEAD~1)
+  --to REF           Target revision for 'changed' (default HEAD)
+  --exit-code        For 'changed': exit 1 when changed, 0 when unchanged
   --current          Only blobs present in the tree at HEAD
   --historical       Only blobs not present in the tree at HEAD
   --no-color         Disable colored output
@@ -85,7 +92,36 @@ Largest contributors
 
 Potential cleanup
   Historical deleted files    4.77 MB
+  Unreachable objects         0 B
+
+Largest contributor:
+  database/prod.sql
+
+Run:
+
+  git weight explain database/prod.sql
 ```
+
+### Change detection for CI
+
+`git weight changed` compares the tree (or blob) hash of a path between two
+revisions — a native, `git`-free `git diff --quiet` for automation:
+
+```sh
+# Rebuild services/api only if it changed since the base branch.
+if git weight changed services/api --base origin/main --exit-code; then
+    echo "no changes under services/api"
+else
+    echo "services/api changed — running build"
+fi
+```
+
+`--base` defaults to `HEAD~1` and `--to` to `HEAD`; both accept ref names,
+full hex oids, and ancestry suffixes (`~N`, `^N`, e.g. `HEAD~2^1`).
+Annotated tags are peeled to their commits. With `--json`, each side is
+reported as `{"ref": ..., "commit": ..., "tree": ...}`, where `tree` holds
+the subtree or blob oid at the path (null when the path is absent on that
+side).
 
 ### Terminology
 
@@ -95,7 +131,7 @@ Potential cleanup
 | Physical size | Actual storage consumed in a packfile or loose object file    |
 | Current     | Object reachable from the tree at `HEAD`                       |
 | Historical  | Object in reachable history, but not in the current `HEAD` tree|
-| Unreachable | Object not reachable from any ref (v0.3)                       |
+| Unreachable | Object not reachable from any ref                             |
 
 ## Exit codes
 
@@ -118,18 +154,25 @@ test/verify.sh     # integration checks against Git plumbing (uses git as a test
 
 ## Status and roadmap
 
-**v0.1** (current): repository discovery (normal, bare, linked worktrees),
+**v0.3** (current): repository discovery (normal, bare, linked worktrees),
 loose-object scanning, pack index v2 parsing, pack entry metadata, native
-zlib streaming, OFS/REF delta resolution for exact logical sizes, object
-counts, largest-blob identification with representative paths and
-current/historical status, human-readable and JSON output, macOS/Linux.
+zlib streaming, OFS/REF delta resolution for exact logical sizes, physical
+(on-disk) sizes per object, reachability analysis, `explain` (per-object
+history: introduced/deleted commits, retaining refs, reclaimable estimate),
+`refs` (unique weight per ref) and `unreachable` commands, `changed`
+(tree/blob change detection between revisions, for CI), human-readable
+and JSON output, macOS/Linux.
+
+Known limitations:
+
+- Single-threaded (`--threads` is accepted but ignored)
+- SHA-256 repositories are not yet supported
+- Windows is not yet supported
 
 Planned:
 
-- **v0.2**: `git weight explain`, deeper historical path resolution, Windows support
-- **v0.3**: reachability analysis, `refs` and `unreachable` commands, physical
-  vs logical contribution, reclaimability estimates, worker-pool parallelism
-- **v1.0**: full "why is this still here?" story per spec
+- **v1.0**: worker-pool parallelism, SHA-256 support, full "why is this
+  still here?" story per spec
 
 See `spec.md` (in the project repository) for the full product definition.
 

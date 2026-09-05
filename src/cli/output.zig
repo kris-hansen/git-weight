@@ -3,6 +3,10 @@ const summary_mod = @import("../analysis/summary.zig");
 const largest_mod = @import("../analysis/largest.zig");
 const objects_mod = @import("../analysis/objects.zig");
 const packs_mod = @import("../analysis/packs.zig");
+const reachability = @import("../analysis/reachability.zig");
+const refs_analysis = @import("../analysis/refs.zig");
+const explain_mod = @import("../analysis/explain.zig");
+const changed_mod = @import("../analysis/changed.zig");
 const object_id = @import("../git/object_id.zig");
 
 pub const WriteError = std.Io.Writer.Error;
@@ -77,6 +81,17 @@ pub fn printSummary(w: *std.Io.Writer, s: *const summary_mod.Summary) WriteError
 
     try w.writeAll("Potential cleanup\n");
     try printSizeLine(w, "Historical deleted files", s.historical_bytes);
+    try printSizeLine(w, "Unreachable objects", s.unreachable_bytes);
+
+    for (s.contributors) |c| {
+        if (c.path) |p| {
+            try w.writeAll("\nLargest contributor:\n");
+            try w.print("  {s}\n\n", .{p});
+            try w.writeAll("Run:\n\n");
+            try w.print("  git weight explain {s}\n", .{p});
+            break;
+        }
+    }
 }
 
 pub fn printLargest(w: *std.Io.Writer, entries: []const largest_mod.BlobEntry) WriteError!void {
@@ -130,6 +145,130 @@ pub fn printPacks(w: *std.Io.Writer, packs: []const packs_mod.PackInfo) WriteErr
         pad = if (count_str.len < 12) 12 - count_str.len else 1;
         while (pad > 0) : (pad -= 1) try w.writeByte(' ');
         try w.print("{s}\n", .{formatSize(&hbuf, p.pack_bytes)});
+    }
+}
+
+fn printPadded(w: *std.Io.Writer, label: []const u8, value: []const u8, col: usize) WriteError!void {
+    try w.print("  {s}", .{label});
+    var pad: usize = if (label.len + 2 < col) col - label.len - 2 else 1;
+    while (pad > 0) : (pad -= 1) try w.writeByte(' ');
+    try w.print("{s}\n", .{value});
+}
+
+pub fn printUnreachable(w: *std.Io.Writer, stats: *const reachability.UnreachableStats) WriteError!void {
+    var sbuf: [32]u8 = undefined;
+    var cbuf: [24]u8 = undefined;
+    try w.writeAll("Unreachable objects\n\n");
+    const count_str = std.fmt.bufPrint(&cbuf, "{d}", .{stats.count}) catch unreachable;
+    try printPadded(w, "Count", count_str, 19);
+    try printPadded(w, "Logical size", formatSize(&sbuf, stats.logical_bytes), 19);
+    try printPadded(w, "Physical size", formatSize(&sbuf, stats.physical_bytes), 19);
+    try w.writeAll("\n");
+    try w.print("Likely reclaimable after garbage collection: {s}\n", .{formatSize(&sbuf, stats.physical_bytes)});
+}
+
+pub fn printRefs(w: *std.Io.Writer, refs: []const refs_analysis.RefWeight) WriteError!void {
+    try w.writeAll("REFERENCE                 UNIQUE WEIGHT\n");
+    var hbuf: [64]u8 = undefined;
+    for (refs) |r| {
+        try w.print("{s}", .{r.name});
+        var pad: usize = if (r.name.len < 26) 26 - r.name.len else 1;
+        while (pad > 0) : (pad -= 1) try w.writeByte(' ');
+        try w.print("{s}\n", .{formatSize(&hbuf, r.unique_bytes)});
+    }
+}
+
+pub fn printExplain(w: *std.Io.Writer, report: *const explain_mod.Report) WriteError!void {
+    var hbuf: [64]u8 = undefined;
+    var sbuf: [32]u8 = undefined;
+    var dbuf: [16]u8 = undefined;
+
+    // Header: representative path when known, otherwise the full oid.
+    if (report.path) |p| {
+        try w.print("{s}\n\n", .{p});
+    } else {
+        try w.print("{s}\n\n", .{report.id.hex(&hbuf)});
+    }
+
+    // Object block, headed by the capitalized type name.
+    const tname = report.object_type.name();
+    var tbuf: [16]u8 = undefined;
+    if (tname.len > 0 and tname.len <= tbuf.len) {
+        tbuf[0] = std.ascii.toUpper(tname[0]);
+        @memcpy(tbuf[1..tname.len], tname[1..]);
+    }
+    try w.print("{s}\n", .{tbuf[0..tname.len]});
+    try printPadded(w, "Object", report.id.hex(&hbuf), 15);
+    try printPadded(w, "Logical size", formatSize(&sbuf, report.logical_bytes), 15);
+    try printPadded(w, "Packed size", formatSize(&sbuf, report.physical_bytes), 15);
+
+    if (report.introduced) |intro| {
+        try w.writeAll("\nHistory\n");
+        try printPadded(w, "Introduced", explain_mod.formatDate(&dbuf, intro.timestamp), 15);
+        try printPadded(w, "Commit", intro.id.abbrev(&hbuf, 7), 15);
+        if (intro.author) |a| try printPadded(w, "Author", a, 15);
+    }
+    if (report.deleted) |del| {
+        try w.writeAll("\n");
+        try printPadded(w, "Deleted", explain_mod.formatDate(&dbuf, del.timestamp), 15);
+        try printPadded(w, "Commit", del.id.abbrev(&hbuf, 7), 15);
+    }
+
+    try w.writeAll("\nReferences retaining this object\n\n");
+    for (report.retained_by) |name| {
+        try w.print("  {s}\n", .{name});
+    }
+
+    try w.writeAll("\nReachability\n\n");
+    try printPadded(w, "Reachable", if (report.reachable) "yes" else "no", 15);
+    try printPadded(w, "From HEAD", if (report.reachable_from_head) "yes" else "no", 15);
+
+    try w.writeAll("\nEstimated reclaimable storage\n\n");
+    if (!report.reachable) {
+        try w.print("  {s} via standard git garbage collection\n", .{formatSize(&sbuf, report.reclaimable_bytes)});
+    } else if (!report.reachable_from_head) {
+        try w.print("  {s} if all retaining refs and history are rewritten\n", .{formatSize(&sbuf, report.reclaimable_bytes)});
+    } else {
+        try w.writeAll("  none — this object is part of the current tree\n");
+    }
+}
+
+pub fn printChanged(w: *std.Io.Writer, report: *const changed_mod.ChangedReport) WriteError!void {
+    var hbuf: [64]u8 = undefined;
+
+    const path = if (report.path.len == 0) "." else report.path;
+    try w.print("{s}\n\n", .{path});
+
+    try w.print("Base       {s} ({s})\n", .{ report.base_ref, report.base_commit.abbrev(&hbuf, 7) });
+    try w.print("To         {s} ({s})\n\n", .{ report.to_ref, report.to_commit.abbrev(&hbuf, 7) });
+
+    // Label from whichever side has the entry (both absent is an error
+    // handled before output).
+    const is_tree = if (report.to_entry) |e|
+        e.is_tree
+    else if (report.base_entry) |e|
+        e.is_tree
+    else
+        true;
+    const label: []const u8 = if (is_tree) "Tree" else "Blob";
+    try printChangedSide(w, label, "base", report.base_entry);
+    try printChangedSide(w, label, "to", report.to_entry);
+    try w.writeAll("\n");
+
+    try w.print("Changed: {s}\n", .{if (report.changed) "yes" else "no"});
+}
+
+fn printChangedSide(w: *std.Io.Writer, label: []const u8, side: []const u8, entry: ?changed_mod.Entry) WriteError!void {
+    var lbuf: [32]u8 = undefined;
+    var hbuf: [64]u8 = undefined;
+    const full = std.fmt.bufPrint(&lbuf, "{s} ({s})", .{ label, side }) catch unreachable;
+    try w.print("{s}", .{full});
+    var pad: usize = if (full.len < 14) 14 - full.len else 1;
+    while (pad > 0) : (pad -= 1) try w.writeByte(' ');
+    if (entry) |e| {
+        try w.print("{s}...\n", .{e.id.abbrev(&hbuf, 8)});
+    } else {
+        try w.writeAll("absent\n");
     }
 }
 

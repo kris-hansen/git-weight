@@ -1,12 +1,16 @@
 const std = @import("std");
 
-pub const version_string = "0.1.0";
+pub const version_string = "0.3.0";
 
 pub const Command = enum {
     summary,
     largest,
     objects,
     packs,
+    explain,
+    refs,
+    @"unreachable",
+    changed,
 };
 
 pub const ParseError = error{
@@ -18,6 +22,16 @@ pub const Options = struct {
     command: Command = .summary,
     /// Repository path (from positional argument or --repo).
     repo_path: ?[]const u8 = null,
+    /// Target argument for `explain` (path or object id).
+    explain_target: ?[]const u8 = null,
+    /// Path argument for `changed`.
+    changed_path: ?[]const u8 = null,
+    /// Base revision for `changed` (default HEAD~1).
+    base_ref: ?[]const u8 = null,
+    /// Target revision for `changed` (default HEAD).
+    to_ref: ?[]const u8 = null,
+    /// For `changed`: exit 1 when changed, 0 when unchanged.
+    exit_code: bool = false,
     json: bool = false,
     limit: usize = 20,
     min_size: u64 = 0,
@@ -38,14 +52,21 @@ pub const usage_text =
     \\  git weight [COMMAND] [PATH] [OPTIONS]
     \\
     \\Commands:
-    \\  summary    High-level repository report (default)
-    \\  largest    Largest blobs in repository history
-    \\  objects    Per-type object counts and logical sizes
-    \\  packs      Packfile statistics
+    \\  summary      High-level repository report (default)
+    \\  largest      Largest blobs in repository history
+    \\  objects      Per-type object counts and logical sizes
+    \\  packs        Packfile statistics
+    \\  explain      Explain why a path or object contributes to repository weight
+    \\  refs         Refs retaining historical weight
+    \\  unreachable  Unreachable objects reclaimable via git gc
+    \\  changed      Whether a path changed between two revisions (CI)
     \\
     \\Options:
     \\  --json             Machine-readable JSON output
-    \\  --limit N          Maximum entries to list (default 20)
+    \\  --limit N          Maximum entries to list (default 20; applies to largest/refs)
+    \\  --base REF         Base revision for 'changed' (default HEAD~1)
+    \\  --to REF           Target revision for 'changed' (default HEAD)
+    \\  --exit-code        For 'changed': exit 1 when changed, 0 when unchanged
     \\  --min-size SIZE    Only include blobs at least SIZE (e.g. 10MB, 500KiB)
     \\  --threads N        Worker thread count (accepted; v0.1 runs single-threaded)
     \\  --current          Only blobs present in the tree at HEAD
@@ -123,6 +144,16 @@ pub fn parse(argv: []const []const u8) ParseError!Options {
                 opts.help = true;
             } else if (std.mem.eql(u8, arg, "--version")) {
                 opts.version = true;
+            } else if (std.mem.eql(u8, arg, "--exit-code")) {
+                opts.exit_code = true;
+            } else if (std.mem.eql(u8, arg, "--base")) {
+                i += 1;
+                if (i >= argv.len) return error.InvalidArguments;
+                opts.base_ref = argv[i];
+            } else if (std.mem.eql(u8, arg, "--to")) {
+                i += 1;
+                if (i >= argv.len) return error.InvalidArguments;
+                opts.to_ref = argv[i];
             } else if (std.mem.eql(u8, arg, "--limit")) {
                 i += 1;
                 if (i >= argv.len) return error.InvalidArguments;
@@ -145,7 +176,8 @@ pub fn parse(argv: []const []const u8) ParseError!Options {
             continue;
         }
 
-        // Positional: command name first, then repository path.
+        // Positional: command name first; the second positional is the
+        // explain target for `explain`, otherwise the repository path.
         if (positional_seen == 0) {
             if (commandFromName(arg)) |cmd| {
                 opts.command = cmd;
@@ -153,7 +185,13 @@ pub fn parse(argv: []const []const u8) ParseError!Options {
                 opts.repo_path = arg;
             }
         } else if (positional_seen == 1) {
-            if (opts.repo_path == null and opts.command != .summary) {
+            if (opts.command == .explain) {
+                if (opts.explain_target != null) return error.InvalidArguments;
+                opts.explain_target = arg;
+            } else if (opts.command == .changed) {
+                if (opts.changed_path != null) return error.InvalidArguments;
+                opts.changed_path = arg;
+            } else if (opts.repo_path == null and opts.command != .summary) {
                 opts.repo_path = arg;
             } else {
                 return error.InvalidArguments;
@@ -164,6 +202,8 @@ pub fn parse(argv: []const []const u8) ParseError!Options {
         positional_seen += 1;
     }
 
+    if (opts.command == .explain and opts.explain_target == null) return error.InvalidArguments;
+    if (opts.command == .changed and opts.changed_path == null) return error.InvalidArguments;
     if (opts.current_only and opts.historical_only) return error.InvalidArguments;
     return opts;
 }
@@ -196,6 +236,30 @@ test "parse args" {
     try std.testing.expectEqual(Command.packs, a3.command);
     try std.testing.expectEqualStrings("/repo", a3.repo_path.?);
     try std.testing.expect(a3.json);
+
+    const a4 = try parse(&.{ "explain", "database/prod.sql" });
+    try std.testing.expectEqual(Command.explain, a4.command);
+    try std.testing.expectEqualStrings("database/prod.sql", a4.explain_target.?);
+    try std.testing.expect(a4.repo_path == null);
+
+    const a5 = try parse(&.{ "refs", "--limit", "5" });
+    try std.testing.expectEqual(Command.refs, a5.command);
+    try std.testing.expectEqual(@as(usize, 5), a5.limit);
+
+    try std.testing.expectError(error.InvalidArguments, parse(&.{"explain"}));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "explain", "a", "b" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "unreachable", "a", "b" }));
+
+    const a6 = try parse(&.{ "changed", "services/api", "--base", "origin/main", "--exit-code" });
+    try std.testing.expectEqual(Command.changed, a6.command);
+    try std.testing.expectEqualStrings("services/api", a6.changed_path.?);
+    try std.testing.expectEqualStrings("origin/main", a6.base_ref.?);
+    try std.testing.expect(a6.exit_code);
+    try std.testing.expect(a6.to_ref == null);
+
+    try std.testing.expectError(error.InvalidArguments, parse(&.{"changed"}));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "changed", "a", "b" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "changed", "--base" }));
 
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "--nope" }));
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "largest", "a", "b" }));

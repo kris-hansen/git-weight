@@ -4,6 +4,7 @@ const refs_mod = @import("../git/refs.zig");
 const object_store = @import("objects.zig");
 const paths_mod = @import("paths.zig");
 const largest_mod = @import("largest.zig");
+const reachability = @import("reachability.zig");
 const filesystem = @import("../platform/filesystem.zig");
 
 pub const SummaryError = error{
@@ -29,6 +30,8 @@ pub const Summary = struct {
     loose_bytes: u64,
     contributors: []Contributor,
     historical_bytes: u64,
+    /// Physical bytes of objects not reachable from any ref.
+    unreachable_bytes: u64,
 
     pub fn deinit(self: *Summary, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -77,6 +80,7 @@ pub fn build(
 
     const contributors = try largest_mod.topBlobs(store, &path_map, allocator, 4, 0, .all);
     const historical_bytes = try largest_mod.historicalWeight(store, &path_map);
+    const unreachable_stats = try reachability.unreachableStats(store, refs, allocator);
 
     const name = repoName(allocator, repo) catch try allocator.dupe(u8, "repository");
     const git_dir_path = try allocator.dupe(u8, repo.git_dir);
@@ -94,6 +98,7 @@ pub fn build(
         .loose_bytes = loose_bytes,
         .contributors = contributors,
         .historical_bytes = historical_bytes,
+        .unreachable_bytes = unreachable_stats.physical_bytes,
     };
 }
 

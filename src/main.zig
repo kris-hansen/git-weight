@@ -4,11 +4,16 @@ const output = @import("cli/output.zig");
 const json = @import("cli/json.zig");
 const repository = @import("git/repository.zig");
 const refs_mod = @import("git/refs.zig");
+const revision = @import("git/revision.zig");
 const objects = @import("analysis/objects.zig");
 const paths = @import("analysis/paths.zig");
 const largest = @import("analysis/largest.zig");
 const summary = @import("analysis/summary.zig");
 const packs = @import("analysis/packs.zig");
+const reachability = @import("analysis/reachability.zig");
+const refs_analysis = @import("analysis/refs.zig");
+const explain_mod = @import("analysis/explain.zig");
+const changed_mod = @import("analysis/changed.zig");
 
 const ExitCode = u8;
 pub const exit_success: ExitCode = 0;
@@ -25,6 +30,7 @@ comptime {
     _ = @import("cli/json.zig");
     _ = @import("git/repository.zig");
     _ = @import("git/refs.zig");
+    _ = @import("git/revision.zig");
     _ = @import("git/object_id.zig");
     _ = @import("git/object.zig");
     _ = @import("git/loose.zig");
@@ -39,6 +45,10 @@ comptime {
     _ = @import("analysis/paths.zig");
     _ = @import("analysis/objects.zig");
     _ = @import("analysis/packs.zig");
+    _ = @import("analysis/reachability.zig");
+    _ = @import("analysis/refs.zig");
+    _ = @import("analysis/explain.zig");
+    _ = @import("analysis/changed.zig");
     _ = @import("platform/mmap.zig");
     _ = @import("platform/filesystem.zig");
 }
@@ -170,6 +180,98 @@ fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.I
             } else {
                 output.printPacks(w, list) catch return exit_general;
             }
+        },
+        .@"unreachable" => {
+            var stats = reachability.unreachableStats(&store, &refs, allocator) catch |err| {
+                return reportAnalysisError(errw, err);
+            };
+            if (opts.json) {
+                var jw: json.JsonWriter = .{ .w = w };
+                json.printUnreachable(&jw, &stats) catch return exit_general;
+            } else {
+                output.printUnreachable(w, &stats) catch return exit_general;
+            }
+        },
+        .refs => {
+            const weights = refs_analysis.uniqueWeights(&store, &refs, allocator, opts.limit) catch |err| {
+                return reportAnalysisError(errw, err);
+            };
+            if (opts.json) {
+                var jw: json.JsonWriter = .{ .w = w };
+                json.printRefs(&jw, weights) catch return exit_general;
+            } else {
+                output.printRefs(w, weights) catch return exit_general;
+            }
+        },
+        .explain => {
+            const target = opts.explain_target orelse {
+                return fail(errw, exit_invalid_args, "error: explain requires a path or object id");
+            };
+            var path_map = paths.compute(&store, &refs, allocator) catch {
+                return fail(errw, exit_general, "error: failed to resolve paths");
+            };
+            defer path_map.deinit();
+            const resolved = explain_mod.resolveTarget(&store, &path_map, target) catch |err| switch (err) {
+                error.NotFound => {
+                    errw.print("error: path not found in repository history: {s}\n", .{target}) catch {};
+                    return exit_general;
+                },
+                error.OutOfMemory => return fail(errw, exit_general, "error: out of memory"),
+                else => return reportAnalysisError(errw, err),
+            };
+            const id = switch (resolved) {
+                .object => |oid| oid,
+                .ambiguous_prefix => |n| {
+                    errw.print("error: ambiguous object prefix '{s}' ({d} matches)\n", .{ target, n }) catch {};
+                    return exit_invalid_args;
+                },
+            };
+            var report = explain_mod.build(&store, &refs, &path_map, id, allocator) catch |err| {
+                return reportAnalysisError(errw, err);
+            };
+            defer report.deinit(allocator);
+            if (opts.json) {
+                var jw: json.JsonWriter = .{ .w = w };
+                json.printExplain(&jw, target, &report) catch return exit_general;
+            } else {
+                output.printExplain(w, &report) catch return exit_general;
+            }
+        },
+        .changed => {
+            const path = opts.changed_path orelse {
+                return fail(errw, exit_invalid_args, "error: changed requires a path");
+            };
+            const base_name = opts.base_ref orelse "HEAD~1";
+            const to_name = opts.to_ref orelse "HEAD";
+            const base_commit = revision.resolve(&store, &refs, base_name, allocator) catch |err| switch (err) {
+                error.OutOfMemory => return fail(errw, exit_general, "error: out of memory"),
+                else => {
+                    errw.print("error: cannot resolve revision: {s}\n", .{base_name}) catch {};
+                    return exit_invalid_args;
+                },
+            };
+            const to_commit = revision.resolve(&store, &refs, to_name, allocator) catch |err| switch (err) {
+                error.OutOfMemory => return fail(errw, exit_general, "error: out of memory"),
+                else => {
+                    errw.print("error: cannot resolve revision: {s}\n", .{to_name}) catch {};
+                    return exit_invalid_args;
+                },
+            };
+            const report = changed_mod.compare(&store, path, base_name, base_commit, to_name, to_commit, allocator) catch |err| switch (err) {
+                error.PathNotFound => {
+                    errw.print("error: path not found in either revision: {s}\n", .{path}) catch {};
+                    return exit_general;
+                },
+                error.OutOfMemory => return fail(errw, exit_general, "error: out of memory"),
+                else => return reportAnalysisError(errw, err),
+            };
+            if (opts.json) {
+                var jw: json.JsonWriter = .{ .w = w };
+                json.printChanged(&jw, &report) catch return exit_general;
+            } else {
+                output.printChanged(w, &report) catch return exit_general;
+            }
+            if (opts.exit_code) return if (report.changed) exit_general else exit_success;
         },
     }
 

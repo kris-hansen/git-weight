@@ -202,6 +202,19 @@ pub const ObjectStore = struct {
         }
     }
 
+    /// Physical (on-disk) size of an object: the loose file size, or the
+    /// span between pack entry offsets.
+    pub fn physicalSize(self: *const ObjectStore, id: *const object_id.ObjectId) StoreError!u64 {
+        switch (self.locate(id)) {
+            .missing => return error.CorruptRepository,
+            .loose => |i| return self.loose.objects.items[i].file_size,
+            .pack => |loc| {
+                const pf = &self.packs.items[loc.pack_id];
+                return pf.pack.nextOffsetAfter(loc.offset) - loc.offset;
+            },
+        }
+    }
+
     /// Total number of distinct objects known to the store.
     pub fn objectCount(self: *const ObjectStore) usize {
         return self.locations.count();
