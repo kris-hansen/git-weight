@@ -2,6 +2,7 @@ const std = @import("std");
 const object_id = @import("../git/object_id.zig");
 const git_object = @import("../git/object.zig");
 const object_store = @import("objects.zig");
+const loose_mod = @import("../git/loose.zig");
 const refs_mod = @import("../git/refs.zig");
 const commit_mod = @import("../git/commit.zig");
 const tree_mod = @import("../git/tree.zig");
@@ -256,6 +257,13 @@ pub fn compute(
     // Full history walk, parallel across workers. Worker structs must stay
     // put once threads see them.
     const n_workers = @max(1, @min(store.threads, max_workers));
+    if (n_workers > 1) {
+        // Pre-resolve loose headers so workers only read shared loose state
+        // (lazy resolution writes back into the list).
+        for (store.loose.objects.items) |*o| {
+            _ = loose_mod.resolveHeader(o) catch continue;
+        }
+    }
     var workers_buf: [max_workers]Worker = undefined;
     var n_init: usize = 0;
     defer for (workers_buf[0..n_init]) |*w| w.deinit();
