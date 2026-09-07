@@ -96,11 +96,6 @@ pub const ObjectStore = struct {
             error.CorruptRepository => return error.CorruptRepository,
             else => return error.Unexpected,
         };
-        // Resolve headers eagerly so worker threads only read shared loose
-        // state (lazy resolution writes back into the list).
-        for (self.loose.objects.items) |*o| {
-            _ = loose_mod.resolveHeader(o) catch continue;
-        }
         for (self.loose.objects.items, 0..) |*o, i| {
             try self.locations.put(self.allocator, o.id, .{ .loose = i });
         }
