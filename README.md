@@ -6,28 +6,54 @@
 
 Unlike `git-sizer` (which identifies structural characteristics that make a repository awkward to work with), `git-weight` explains where repository storage is going and why that storage is still retained.
 
-## Install
+## Getting started
 
-Homebrew (available after the first stable release):
+Install with Homebrew on macOS 14+ or Linux (Intel and ARM64):
 
 ```sh
 brew install kris-hansen/git-weight/git-weight
+git weight --version
 ```
 
-Prebuilt release archives support macOS 14+ and Linux on Intel and ARM64.
-Download them from [GitHub Releases](https://github.com/kris-hansen/git-weight/releases).
+The Homebrew package becomes available after the first stable release is published.
 
-Build from source with [Zig](https://ziglang.org) 0.16+:
+Go to a Git repository and find what's taking up space:
+
+```sh
+cd /path/to/your/repository
+git weight                       # overall storage report
+git weight largest --limit 10    # largest files in repository history
+git weight largest --historical  # files no longer present at HEAD
+```
+
+To investigate a file from the report, replace `path/to/large-file` below with
+its path. You can also export the summary as JSON:
+
+```sh
+git weight explain path/to/large-file
+git weight --json > weight-report.json
+```
+
+`git weight` and `git-weight` are equivalent. All analysis is read-only.
+
+Update to the latest release with:
+
+```sh
+brew update
+brew upgrade git-weight
+```
+
+### Other installation options
+
+Download a prebuilt archive from [GitHub Releases](https://github.com/kris-hansen/git-weight/releases),
+or build from a checkout of this repository with [Zig](https://ziglang.org) 0.16+:
 
 ```sh
 zig build -Doptimize=ReleaseFast
+./zig-out/bin/git-weight --version
 ```
 
-The binary is named `git-weight`, so Git can invoke it as a subcommand when it is on your `$PATH`:
-
-```sh
-git weight          # same as git-weight
-```
+Put the resulting `zig-out/bin/git-weight` binary on your `$PATH` to use `git weight`.
 
 ## Usage
 
