@@ -262,7 +262,7 @@ REPO="$FIXTURES/empty"
 mkdir -p "$REPO"
 cd "$REPO"
 git init -q -b main
-"$GW" --json | python3 -c "
+"$GW" summary --repo "$REPO" --json | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 assert d['objects']['blob']['count'] == 0
