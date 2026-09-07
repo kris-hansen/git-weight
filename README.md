@@ -39,7 +39,7 @@ Options:
   --json             Machine-readable JSON output
   --limit N          Maximum entries to list (default 20; applies to largest/refs)
   --min-size SIZE    Only include blobs at least SIZE (e.g. 10MB, 500KiB)
-  --threads N        Worker thread count (accepted; currently single-threaded)
+  --threads N        Worker thread count (default: CPU count)
   --base REF         Base revision for 'changed' (default HEAD~1)
   --to REF           Target revision for 'changed' (default HEAD)
   --exit-code        For 'changed': exit 1 when changed, 0 when unchanged
@@ -133,7 +133,9 @@ fi
 
 ## Performance
 
-git-weight aims to be the fastest way to interrogate a Git repository. It reads packfiles, indexes, loose objects, and refs directly — no `git` subprocess, no runtime — memory-mapped I/O, memoized delta-chain resolution, a delta-base payload cache, and lazy indexing so cheap commands (`changed`) never pay for a full object scan.
+git-weight aims to be the fastest way to interrogate a Git repository. It reads packfiles, indexes, loose objects, and refs directly — no `git` subprocess, no runtime — with memory-mapped I/O, memoized delta-chain resolution, a shared delta-base payload cache, lazy indexing so cheap commands (`changed`) never pay for a full object scan, and a parallel worker pool: whole-store passes shard across `--threads N` workers (default: CPU count), and the history walk splits a sequential commit-graph traversal from a perfectly-sharded parallel tree walk.
+
+Benchmarks with [hyperfine](https://github.com/sharkdp/hyperfine) (mean of 10+ runs; 2 runs for the huge repo), Apple Silicon, `zig build -Doptimize=ReleaseFast`. Reproduce with `test/bench.sh REPO LABEL PATH`.
 
 Benchmarks with [hyperfine](https://github.com/sharkdp/hyperfine) (mean of 10+ runs; 2 runs for the huge repo), Apple Silicon, `zig build -Doptimize=ReleaseFast`. Reproduce with `test/bench.sh REPO LABEL PATH`.
 
@@ -141,22 +143,31 @@ Benchmarks with [hyperfine](https://github.com/sharkdp/hyperfine) (mean of 10+ r
 
 | benchmark | alternative | git-weight | result |
 |---|---|---|---|
-| `summary` | git-sizer (229ms) | 154ms | **1.5× faster** |
-| `changed` | `git diff --quiet` (11ms) | 8ms | **1.4× faster** |
-| `packs` | `git verify-pack` (143ms) | 17ms | **8.2× faster** |
-| `unreachable` | `git fsck --unreachable` (229ms) | 129ms | **1.8× faster** |
+| `summary` | git-sizer (194ms) | 125ms | **1.5× faster** |
+| `changed` | `git diff --quiet` (10ms) | 7ms | **1.5× faster** |
+| `packs` | `git verify-pack` (129ms) | 87ms | **1.5× faster** |
+| `unreachable` | `git fsck --unreachable` (207ms) | 122ms | **1.7× faster** |
+
+**ollama** — 84MB `.git`, 50k objects, 7k commits:
+
+| benchmark | alternative | git-weight | result |
+|---|---|---|---|
+| `summary` | git-sizer (228ms) | 142ms | **1.6× faster** |
+| `changed` | `git diff --quiet` (10ms) | 9ms | **1.2× faster** |
+| `packs` | `git verify-pack` (1242ms) | 14ms | **91× faster** |
 
 **homebrew-core** — 949MB `.git`, 2.5M objects, 595k commits:
 
 | benchmark | alternative | git-weight | result |
 |---|---|---|---|
-| `summary` | git-sizer (165s) | 121s | **1.4× faster** |
-| `changed` | `git diff --quiet` (16ms) | 9ms | **1.7× faster** |
-| `packs` | `git verify-pack` (71s) | 388ms | **184× faster** |
+| `summary` | git-sizer (144s) | 47s | **3.1× faster** |
+| `changed` | `git diff --quiet` (17ms) | 8ms | **2.1× faster** |
+| `packs` | `git verify-pack` (62s) | 342ms | **181× faster** |
+| `largest` | rev-list + cat-file pipeline (45s) | 49s | parity |
 
-Known gaps, being honest about them: `largest` trails the `git rev-list --objects --all | git cat-file --batch-check` pipeline (~2–3× on large repos) and `explain` trails `git log --all -- <path>` — though both plumbing commands compute strictly less (no physical sizes, retention, or reachability). Closing those is the roadmap:
+Remaining gaps, being honest about them: `explain` trails `git log --all -- <path>` (its history and retention phases are still sequential), and `largest` is at parity with the `git rev-list --objects --all | git cat-file --batch-check` pipeline — though both plumbing commands compute strictly less (no physical sizes, retention, or reachability). Closing those is the roadmap:
 
-- **v1.0 worker-pool parallelism** — git-sizer already parallelizes; git-weight is currently single-threaded (`--threads` is accepted but ignored).
+- **Parallel `explain` phases** — per-ref retention walks and commit-history analysis shard like the rest.
 - **Zero-copy payload reads** — borrowed cache entries instead of copy-on-hit.
 - **System zlib option** — the pure-Zig inflater trades a little speed for zero dependencies.
 
@@ -173,17 +184,16 @@ test/bench.sh REPO LABEL PATH [heavy|huge]  # benchmark against git plumbing and
 
 ## Status and roadmap
 
-**v0.3** (current): repository discovery (normal, bare, linked worktrees), loose-object scanning, pack index v2 parsing, pack entry metadata, native zlib streaming, OFS/REF delta resolution for exact logical sizes, physical (on-disk) sizes per object, reachability analysis, `explain` (per-object history: introduced/deleted commits, retaining refs, reclaimable estimate), `refs` (unique weight per ref) and `unreachable` commands, `changed` (tree/blob change detection between revisions, for CI), human-readable and JSON output, macOS/Linux.
+**v0.4** (current): everything in v0.3 plus the bounded worker pool (`--threads N`, default CPU count): parallel whole-store passes and a parallel history tree walk with deterministic output, shared thread-safe delta-base payload cache, memoized delta-chain info resolution, and lazy store indexing.
 
 Known limitations:
 
-- Single-threaded (`--threads` is accepted but ignored)
 - SHA-256 repositories are not yet supported
 - Windows is not yet supported
 
 Planned:
 
-- **v1.0**: worker-pool parallelism, SHA-256 support, full "why is this still here?" story per spec
+- **v1.0**: SHA-256 support, parallel `explain` phases, zero-copy payload reads, full "why is this still here?" story per spec
 
 See `spec.md` (in the project repository) for the full product definition.
 

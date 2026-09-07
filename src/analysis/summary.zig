@@ -4,6 +4,7 @@ const refs_mod = @import("../git/refs.zig");
 const object_store = @import("objects.zig");
 const paths_mod = @import("paths.zig");
 const largest_mod = @import("largest.zig");
+const scan_mod = @import("scan.zig");
 const reachability = @import("reachability.zig");
 const filesystem = @import("../platform/filesystem.zig");
 
@@ -73,17 +74,18 @@ pub fn build(
     var loose_bytes: u64 = 0;
     for (store.loose.objects.items) |o| loose_bytes += o.file_size;
 
-    const stats = try object_store.computeStats(store);
-
     var path_map = try paths_mod.compute(store, refs, allocator);
     defer path_map.deinit();
 
-    const contributors = try largest_mod.topBlobs(store, &path_map, allocator, 4, 0, .all);
-    const historical_bytes = try largest_mod.historicalWeight(store, &path_map);
-    // paths.compute already visited every reachable object; reuse its set
-    // instead of a second full graph walk.
+    // One parallel pass for type stats, top blobs, historical weight, and
+    // unreachable stats; paths.compute already visited every reachable
+    // object, so its set doubles as the reachability input.
     const reachable = reachability.Reachable{ .allocator = allocator, .set = path_map.reachable };
-    const unreachable_stats = try reachability.statsFor(store, &reachable);
+    const scan_r = try scan_mod.fullScan(store, &path_map, &reachable, 4, 0, .all, allocator);
+    const stats = scan_r.stats;
+    const contributors = scan_r.top;
+    const historical_bytes = scan_r.historical_bytes;
+    const unreachable_stats = scan_r.unreachable_stats;
 
     const name = repoName(allocator, repo) catch try allocator.dupe(u8, "repository");
     const git_dir_path = try allocator.dupe(u8, repo.git_dir);
