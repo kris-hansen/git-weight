@@ -68,7 +68,7 @@ pub const usage_text =
     \\  --to REF           Target revision for 'changed' (default HEAD)
     \\  --exit-code        For 'changed': exit 1 when changed, 0 when unchanged
     \\  --min-size SIZE    Only include blobs at least SIZE (e.g. 10MB, 500KiB)
-    \\  --threads N        Worker thread count (accepted; v0.1 runs single-threaded)
+    \\  --threads N        Worker thread count (default: detected CPU count)
     \\  --current          Only blobs present in the tree at HEAD
     \\  --historical       Only blobs not present in the tree at HEAD
     \\  --no-color         Disable colored output

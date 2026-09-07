@@ -94,29 +94,3 @@ pub const UnreachableStats = struct {
     logical_bytes: u64,
     physical_bytes: u64,
 };
-
-/// Aggregate counts and sizes of objects not reachable from any ref.
-pub fn unreachableStats(
-    store: *const object_store.ObjectStore,
-    refs: *const refs_mod.Refs,
-    allocator: std.mem.Allocator,
-) ReachError!UnreachableStats {
-    var reachable = try computeAll(store, refs, allocator);
-    defer reachable.deinit();
-    return statsFor(store, &reachable);
-}
-
-/// Aggregate counts and sizes of objects not in `reachable`.
-pub fn statsFor(store: *const object_store.ObjectStore, reachable: *const Reachable) ReachError!UnreachableStats {
-    var stats: UnreachableStats = .{ .count = 0, .logical_bytes = 0, .physical_bytes = 0 };
-    var it = store.locations.iterator();
-    while (it.next()) |e| {
-        if (reachable.contains(e.key_ptr)) continue;
-        const inf = store.info(e.key_ptr) catch continue;
-        const phys = store.physicalSize(e.key_ptr) catch 0;
-        stats.count += 1;
-        stats.logical_bytes += inf.size;
-        stats.physical_bytes += phys;
-    }
-    return stats;
-}

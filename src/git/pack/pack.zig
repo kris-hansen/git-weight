@@ -38,6 +38,10 @@ fn orderU64(a: u64, b: u64) std.math.Order {
     return std.math.order(a, b);
 }
 
+fn lockSpin(m: *std.atomic.Mutex) void {
+    while (!m.tryLock()) std.atomic.spinLoopHint();
+}
+
 /// A packfile plus its index, both memory-mapped.
 pub const Pack = struct {
     data: []const u8,
@@ -287,49 +291,83 @@ pub const Pack = struct {
     };
 
     /// Cache of reconstructed payloads by pack offset (the equivalent of
-    /// git's delta base cache). When `total_bytes` exceeds `budget` the whole
-    /// cache is cleared — delta chains are resolved and consumed in one
-    /// burst, so chain-local reuse (the common case) survives clearing while
-    /// per-insert eviction bookkeeping is avoided entirely. Entries larger
-    /// than `max_entry_size` are never cached. Owns all cached bytes.
+    /// git's delta base cache). Thread-safe: sharded by offset, each shard
+    /// spinlocked. When a shard exceeds its share of `budget` it is cleared
+    /// — delta chains are resolved and consumed in one burst, so chain-local
+    /// reuse (the common case) survives clearing. Entries larger than
+    /// `max_entry_size` are never cached. Owns all cached bytes.
     pub const PayloadCache = struct {
         pub const Entry = struct {
             object_type: git_object.ObjectType,
             data: []u8,
         };
 
+        const n_shards = 16;
+        const Shard = struct {
+            mutex: std.atomic.Mutex = .unlocked,
+            map: std.AutoHashMapUnmanaged(u64, Entry) = .empty,
+            total_bytes: u64 = 0,
+        };
+
         allocator: std.mem.Allocator,
-        map: std.AutoHashMapUnmanaged(u64, Entry) = .empty,
-        total_bytes: u64 = 0,
-        budget: u64 = 128 << 20,
+        shards: [n_shards]Shard,
+        budget: u64 = 256 << 20,
 
         const max_entry_size = 4 << 20;
 
-        pub fn deinit(self: *PayloadCache) void {
-            var it = self.map.iterator();
-            while (it.next()) |e| self.allocator.free(e.value_ptr.data);
-            self.map.deinit(self.allocator);
+        pub fn init(allocator: std.mem.Allocator) PayloadCache {
+            var c: PayloadCache = .{ .allocator = allocator, .shards = undefined };
+            for (&c.shards) |*s| s.* = .{};
+            return c;
         }
 
-        fn get(self: *const PayloadCache, offset: u64) ?Entry {
-            return self.map.get(offset);
+        pub fn deinit(self: *PayloadCache) void {
+            for (&self.shards) |*s| {
+                var it = s.map.iterator();
+                while (it.next()) |e| self.allocator.free(e.value_ptr.data);
+                s.map.deinit(self.allocator);
+            }
+        }
+
+        fn shardFor(self: *PayloadCache, offset: u64) *Shard {
+            return &self.shards[@intCast((offset >> 12) % n_shards)];
+        }
+
+        /// Returns a copy of the cached payload (allocated from `dest`),
+        /// or null on a miss. The copy happens under the shard lock because
+        /// entries can be cleared at any time.
+        fn get(self: *PayloadCache, offset: u64, dest: std.mem.Allocator) ?Entry {
+            const s = self.shardFor(offset);
+            lockSpin(&s.mutex);
+            defer s.mutex.unlock();
+            const e = s.map.get(offset) orelse return null;
+            const copy = dest.dupe(u8, e.data) catch return null;
+            return .{ .object_type = e.object_type, .data = copy };
         }
 
         fn put(self: *PayloadCache, offset: u64, object_type: git_object.ObjectType, data: []const u8) void {
             if (data.len > max_entry_size) return;
-            if (self.map.contains(offset)) return;
-            if (self.total_bytes + data.len > self.budget) {
-                var it = self.map.iterator();
-                while (it.next()) |e| self.allocator.free(e.value_ptr.data);
-                self.map.clearRetainingCapacity();
-                self.total_bytes = 0;
-            }
+            // Copy before taking the lock to shorten the critical section.
             const copy = self.allocator.dupe(u8, data) catch return;
-            self.map.put(self.allocator, offset, .{ .object_type = object_type, .data = copy }) catch {
+            const s = self.shardFor(offset);
+            const shard_budget = self.budget / n_shards;
+            lockSpin(&s.mutex);
+            defer s.mutex.unlock();
+            if (s.map.contains(offset)) {
+                self.allocator.free(copy);
+                return;
+            }
+            if (s.total_bytes + data.len > shard_budget) {
+                var it = s.map.iterator();
+                while (it.next()) |e| self.allocator.free(e.value_ptr.data);
+                s.map.clearRetainingCapacity();
+                s.total_bytes = 0;
+            }
+            s.map.put(self.allocator, offset, .{ .object_type = object_type, .data = copy }) catch {
                 self.allocator.free(copy);
                 return;
             };
-            self.total_bytes += copy.len;
+            s.total_bytes += copy.len;
         }
     };
 
@@ -344,9 +382,8 @@ pub const Pack = struct {
     fn readPayloadDepth(self: *const Pack, allocator: std.mem.Allocator, offset: u64, cache: ?*PayloadCache, depth: usize) PackError!Payload {
         if (depth > max_delta_depth) return error.CorruptPack;
         if (cache) |c| {
-            if (c.get(offset)) |cached| {
-                const dupe = allocator.dupe(u8, cached.data) catch return error.OutOfMemory;
-                return .{ .object_type = cached.object_type, .data = dupe };
+            if (c.get(offset, allocator)) |cached| {
+                return .{ .object_type = cached.object_type, .data = cached.data };
             }
         }
         const raw = try self.readRawEntry(offset);
