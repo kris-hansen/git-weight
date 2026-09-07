@@ -62,6 +62,8 @@ pub const ObjectStore = struct {
     /// Owned copy of the objects directory path, for lazy loose probes.
     objects_dir: []const u8,
     indexed: bool,
+    /// Worker thread count for parallel passes; 1 = single-threaded.
+    threads: usize = 1,
 
     pub fn open(allocator: std.mem.Allocator, repo: *const Repository) StoreError!ObjectStore {
         var obuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -94,6 +96,11 @@ pub const ObjectStore = struct {
             error.CorruptRepository => return error.CorruptRepository,
             else => return error.Unexpected,
         };
+        // Resolve headers eagerly so worker threads only read shared loose
+        // state (lazy resolution writes back into the list).
+        for (self.loose.objects.items) |*o| {
+            _ = loose_mod.resolveHeader(o) catch continue;
+        }
         for (self.loose.objects.items, 0..) |*o, i| {
             try self.locations.put(self.allocator, o.id, .{ .loose = i });
         }
@@ -158,10 +165,11 @@ pub const ObjectStore = struct {
             info_cache.* = .empty;
 
             // The payload cache evicts and frees entries; it must use a
-            // freeing allocator, not the process-wide arena.
+            // freeing allocator, not the process-wide arena. It is
+            // thread-safe (sharded locks) and shared by all workers.
             const payload_cache = try self.allocator.create(pack_mod.Pack.PayloadCache);
             errdefer self.allocator.destroy(payload_cache);
-            payload_cache.* = .{ .allocator = std.heap.page_allocator };
+            payload_cache.* = pack_mod.Pack.PayloadCache.init(std.heap.page_allocator);
 
             const path_copy = try self.allocator.dupe(u8, pack_path);
             errdefer self.allocator.free(path_copy);
@@ -243,6 +251,7 @@ pub const ObjectStore = struct {
     };
 
     /// Fully reconstruct an object's payload. Caller frees `data`.
+    /// Thread-safe: the shared payload cache takes care of synchronization.
     pub fn readPayload(self: *const ObjectStore, allocator: std.mem.Allocator, id: *const object_id.ObjectId) StoreError!Payload {
         switch (self.locate(id)) {
             .missing => return error.CorruptRepository,
@@ -336,17 +345,3 @@ pub const ObjectStats = struct {
         };
     }
 };
-
-/// Aggregate per-type counts and logical sizes across all objects.
-pub fn computeStats(store: *const ObjectStore) StoreError!ObjectStats {
-    var stats: ObjectStats = .{};
-    var it = store.locations.iterator();
-    while (it.next()) |e| {
-        const inf = try store.info(&e.key_ptr.*);
-        if (!inf.object_type.isReal()) continue;
-        const s = stats.forType(inf.object_type);
-        s.count += 1;
-        s.logical_bytes += inf.size;
-    }
-    return stats;
-}

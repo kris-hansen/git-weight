@@ -14,6 +14,7 @@ const reachability = @import("analysis/reachability.zig");
 const refs_analysis = @import("analysis/refs.zig");
 const explain_mod = @import("analysis/explain.zig");
 const changed_mod = @import("analysis/changed.zig");
+const scan_mod = @import("analysis/scan.zig");
 
 const ExitCode = u8;
 pub const exit_success: ExitCode = 0;
@@ -73,6 +74,7 @@ comptime {
     _ = @import("analysis/refs.zig");
     _ = @import("analysis/explain.zig");
     _ = @import("analysis/changed.zig");
+    _ = @import("analysis/scan.zig");
     _ = @import("platform/mmap.zig");
     _ = @import("platform/filesystem.zig");
 }
@@ -155,6 +157,8 @@ fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.I
         };
     }
 
+    store.threads = opts.threads orelse (std.Thread.getCpuCount() catch 1);
+
     if (store.indexed) {
         timer.mark("open: {d} objects, {d} refs in", .{ store.objectCount(), refs.refs.items.len });
     } else {
@@ -183,9 +187,10 @@ fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.I
                 return fail(errw, exit_general, "error: failed to resolve paths");
             };
             timer.mark("paths: {d} blob paths in", .{path_map.paths.count()});
-            const entries = largest.topBlobs(&store, &path_map, allocator, opts.limit, opts.min_size, filter) catch {
+            const scan_r = scan_mod.fullScan(&store, &path_map, null, opts.limit, opts.min_size, filter, allocator) catch {
                 return fail(errw, exit_general, "error: failed to analyze blobs");
             };
+            const entries = scan_r.top;
             timer.mark("analysis: largest in", .{});
             if (opts.json) {
                 var jw: json.JsonWriter = .{ .w = w };
@@ -195,15 +200,15 @@ fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.I
             }
         },
         .objects => {
-            const stats = objects.computeStats(&store) catch {
+            const r = scan_mod.fullScan(&store, null, null, 0, 0, .all, allocator) catch {
                 return fail(errw, exit_general, "error: failed to analyze objects");
             };
             timer.mark("analysis: objects in", .{});
             if (opts.json) {
                 var jw: json.JsonWriter = .{ .w = w };
-                json.printObjects(&jw, &stats) catch return exit_general;
+                json.printObjects(&jw, &r.stats) catch return exit_general;
             } else {
-                output.printObjects(w, &stats) catch return exit_general;
+                output.printObjects(w, &r.stats) catch return exit_general;
             }
         },
         .packs => {
@@ -219,9 +224,14 @@ fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.I
             }
         },
         .@"unreachable" => {
-            var stats = reachability.unreachableStats(&store, &refs, allocator) catch |err| {
+            var all = reachability.computeAll(&store, &refs, allocator) catch |err| {
                 return reportAnalysisError(errw, err);
             };
+            defer all.deinit();
+            const scan_r = scan_mod.fullScan(&store, null, &all, 0, 0, .all, allocator) catch |err| {
+                return reportAnalysisError(errw, err);
+            };
+            var stats = scan_r.unreachable_stats;
             timer.mark("analysis: unreachable in", .{});
             if (opts.json) {
                 var jw: json.JsonWriter = .{ .w = w };
