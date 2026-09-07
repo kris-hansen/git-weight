@@ -15,8 +15,6 @@ brew install kris-hansen/git-weight/git-weight
 git weight --version
 ```
 
-The Homebrew package becomes available after the first stable release is published.
-
 Go to a Git repository and find what's taking up space:
 
 ```sh
