@@ -2,3 +2,5 @@
 zig-out/
 bench-results/
 *.o
+dist/
+__pycache__/

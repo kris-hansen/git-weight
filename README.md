@@ -8,6 +8,15 @@ Unlike `git-sizer` (which identifies structural characteristics that make a repo
 
 ## Install
 
+Homebrew (available after the first stable release):
+
+```sh
+brew install kris-hansen/git-weight/git-weight
+```
+
+Prebuilt release archives support macOS 14+ and Linux on Intel and ARM64.
+Download them from [GitHub Releases](https://github.com/kris-hansen/git-weight/releases).
+
 Build from source with [Zig](https://ziglang.org) 0.16+:
 
 ```sh
@@ -183,6 +192,8 @@ test/bench.sh REPO LABEL PATH [heavy|huge]  # benchmark against git plumbing and
 ```
 
 ## Status and roadmap
+
+Maintainers: see [Releasing](docs/releasing.md) for the GitHub Actions and Homebrew pipeline.
 
 **v0.4** (current): everything in v0.3 plus the bounded worker pool (`--threads N`, default CPU count): parallel whole-store passes and a parallel history tree walk with deterministic output, shared thread-safe delta-base payload cache, memoized delta-chain info resolution, and lazy store indexing.
 

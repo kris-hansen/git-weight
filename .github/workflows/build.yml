@@ -1,0 +1,66 @@
+name: Build and test
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-macos.14.0
+            platform: darwin-arm64
+          - runner: macos-15-intel
+            target: x86_64-macos.14.0
+            platform: darwin-amd64
+          - runner: ubuntu-24.04
+            target: x86_64-linux-musl
+            platform: linux-amd64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-linux-musl
+            platform: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Unit tests
+        run: zig build test
+      - name: Build portable release binary
+        env:
+          VERSION: ${{ inputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: zig build -Doptimize=ReleaseFast -Dcpu=baseline -Dtarget="$TARGET" -Dversion="$VERSION"
+      - name: Check version and integration tests
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          test "$(zig-out/bin/git-weight --version)" = "git-weight $VERSION"
+          sh test/verify.sh
+      - name: Package
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          mkdir -p dist
+          tar -czf "dist/git-weight-$PLATFORM.tar.gz" -C zig-out/bin git-weight -C "$GITHUB_WORKSPACE" LICENSE README.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: git-weight-${{ matrix.platform }}
+          path: dist/*.tar.gz
+          if-no-files-found: error

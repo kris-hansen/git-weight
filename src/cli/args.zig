@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const version_string = "0.3.0";
+pub const version_string = @import("build_options").version;
 
 pub const Command = enum {
     summary,

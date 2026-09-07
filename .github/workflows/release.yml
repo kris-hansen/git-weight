@@ -1,0 +1,116 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to release (e.g. v0.4.0)
+        required: true
+        type: string
+
+# Serialize releases so two tap updates cannot race.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      sha: ${{ steps.release.outputs.sha }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate and resolve tag
+        id: release
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          python3 scripts/release.py validate "$TAG" >> "$GITHUB_OUTPUT"
+          printf 'sha=%s\n' "$(git rev-parse --verify "refs/tags/$TAG^{commit}")" >> "$GITHUB_OUTPUT"
+      - name: Check tap credentials for stable releases
+        if: steps.release.outputs.prerelease == 'false'
+        env:
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          if [ -z "$TAP_GITHUB_TOKEN" ]; then
+            echo '::error::Set TAP_GITHUB_TOKEN with Contents: read/write on kris-hansen/homebrew-git-weight. See docs/releasing.md.'
+            exit 1
+          fi
+
+  build:
+    needs: prepare
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ needs.prepare.outputs.sha }}
+      version: ${{ needs.prepare.outputs.version }}
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: git-weight-*
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums and Homebrew formula
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          python3 -m unittest discover -s test -p 'test_release.py'
+          python3 scripts/release.py package "$TAG" dist
+          ruby -c dist/git-weight.rb
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+        run: |
+          # Create as a draft so users never see a partially uploaded release.
+          gh release create "$TAG" dist/*.tar.gz dist/checksums.txt dist/git-weight.rb \
+            --verify-tag --title "$TAG" --generate-notes --draft --prerelease="$PRERELEASE"
+          gh release edit "$TAG" --draft=false
+
+  homebrew:
+    needs: [prepare, publish]
+    if: needs.prepare.outputs.prerelease == 'false'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: kris-hansen/homebrew-git-weight
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+      - name: Download published formula
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: gh release download "$TAG" --pattern git-weight.rb --dir Formula --clobber
+      - name: Update tap
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Formula/git-weight.rb
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "git-weight $TAG"
+          git push
