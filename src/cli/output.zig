@@ -88,7 +88,7 @@ pub fn printSummary(w: *std.Io.Writer, s: *const summary_mod.Summary) WriteError
             try w.writeAll("\nLargest contributor:\n");
             try w.print("  {s}\n\n", .{p});
             try w.writeAll("Run:\n\n");
-            try w.print("  git weight explain {s}\n", .{p});
+            try w.print("  git-weight explain {s}\n", .{p});
             break;
         }
     }

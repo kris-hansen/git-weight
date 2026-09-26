@@ -49,7 +49,7 @@ pub const usage_text =
     \\git-weight — find out what's weighing down your Git repository.
     \\
     \\Usage:
-    \\  git weight [COMMAND] [PATH] [OPTIONS]
+    \\  git-weight [COMMAND] [PATH] [OPTIONS]
     \\
     \\Commands:
     \\  summary      High-level repository report (default)

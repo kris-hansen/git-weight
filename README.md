@@ -12,27 +12,27 @@ Install with Homebrew on macOS 14+ or Linux (Intel and ARM64):
 
 ```sh
 brew install kris-hansen/git-weight/git-weight
-git weight --version
+git-weight --version
 ```
 
 Go to a Git repository and find what's taking up space:
 
 ```sh
 cd /path/to/your/repository
-git weight                       # overall storage report
-git weight largest --limit 10    # largest files in repository history
-git weight largest --historical  # files no longer present at HEAD
+git-weight                       # overall storage report
+git-weight largest --limit 10    # largest files in repository history
+git-weight largest --historical  # files no longer present at HEAD
 ```
 
 To investigate a file from the report, replace `path/to/large-file` below with
 its path. You can also export the summary as JSON:
 
 ```sh
-git weight explain path/to/large-file
-git weight --json > weight-report.json
+git-weight explain path/to/large-file
+git-weight --json > weight-report.json
 ```
 
-`git weight` and `git-weight` are equivalent. All analysis is read-only.
+All analysis is read-only.
 
 Update to the latest release with:
 
@@ -51,12 +51,12 @@ zig build -Doptimize=ReleaseFast
 ./zig-out/bin/git-weight --version
 ```
 
-Put the resulting `zig-out/bin/git-weight` binary on your `$PATH` to use `git weight`.
+Put the resulting `zig-out/bin/git-weight` binary on your `$PATH` to use `git-weight`.
 
 ## Usage
 
 ```text
-git weight [COMMAND] [PATH] [OPTIONS]
+git-weight [COMMAND] [PATH] [OPTIONS]
 
 Commands:
   summary      High-level repository report (default)
@@ -89,7 +89,7 @@ Options:
 Example:
 
 ```text
-$ git weight
+$ git-weight
 
 Repository: my-project
 
@@ -125,16 +125,16 @@ Largest contributor:
 
 Run:
 
-  git weight explain database/prod.sql
+  git-weight explain database/prod.sql
 ```
 
 ### Change detection for CI
 
-`git weight changed` compares the tree (or blob) hash of a path between two revisions — a native, `git`-free `git diff --quiet` for automation:
+`git-weight changed` compares the tree (or blob) hash of a path between two revisions — a native, `git`-free `git diff --quiet` for automation:
 
 ```sh
 # Rebuild services/api only if it changed since the base branch.
-if git weight changed services/api --base origin/main --exit-code; then
+if git-weight changed services/api --base origin/main --exit-code; then
     echo "no changes under services/api"
 else
     echo "services/api changed — running build"

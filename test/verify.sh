@@ -446,7 +446,7 @@ d = json.load(sys.stdin)
 assert 'unreachable_bytes' in d, d.keys()
 print('ok: summary json has unreachable_bytes')"
 "$GW" | grep -q "Largest contributor:" || fail "summary missing Largest contributor"
-"$GW" | grep -q "git weight explain" || fail "summary missing explain hint"
+"$GW" | grep -q "git-weight explain" || fail "summary missing explain hint"
 echo "ok: summary shows largest contributor hint"
 
 # --- explain error cases ----------------------------------------------------------
