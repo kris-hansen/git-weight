@@ -4,6 +4,7 @@ const Repository = @import("../git/repository.zig").Repository;
 const object_id = @import("../git/object_id.zig");
 const git_object = @import("../git/object.zig");
 const loose_mod = @import("../git/loose.zig");
+const inflate = @import("../git/inflate.zig");
 const pack_mod = @import("../git/pack/pack.zig");
 const index_mod = @import("../git/pack/index.zig");
 const mmap = @import("../platform/mmap.zig");
@@ -276,18 +277,18 @@ pub const ObjectStore = struct {
         const size: usize = @intCast(header.size);
         const out = allocator.alloc(u8, size) catch return error.OutOfMemory;
         errdefer allocator.free(out);
-        var in = Io.Reader.fixed(mf.data);
-        var window: [std.compress.flate.max_window_len]u8 = undefined;
-        var decomp = std.compress.flate.Decompress.init(&in, .zlib, &window);
+        var infl: inflate.Inflater = undefined;
+        infl.init(mf.data);
+        defer infl.deinit();
         var first: [512]u8 = undefined;
-        const n = decomp.reader.readSliceShort(&first) catch return error.CorruptRepository;
+        const n = infl.read(&first) catch return error.CorruptRepository;
         const parsed = git_object.parseHeader(first[0..n]) catch return error.CorruptRepository;
         if (parsed.payload_start > n) return error.CorruptRepository;
         const avail = n - parsed.payload_start;
         const take = @min(avail, size);
         @memcpy(out[0..take], first[parsed.payload_start .. parsed.payload_start + take]);
         if (take < size) {
-            decomp.reader.readSliceAll(out[take..]) catch return error.CorruptRepository;
+            infl.readAll(out[take..]) catch return error.CorruptRepository;
         }
         return .{ .object_type = header.object_type, .data = out };
     }
