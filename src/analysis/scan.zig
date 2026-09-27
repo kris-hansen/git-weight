@@ -48,7 +48,9 @@ pub fn fullScan(
     filter: largest_mod.Filter,
     allocator: std.mem.Allocator,
 ) ScanError!ScanResult {
-    const n_threads = @max(1, @min(store.threads, 64));
+    // Explicit usize: the @min bound otherwise infers a 7-bit type that
+    // overflows in `n_threads * 4` below once threads reaches 32.
+    const n_threads: usize = @max(1, @min(store.threads, 64));
 
     // Build the shard list: contiguous index ranges per pack, plus loose
     // ranges.

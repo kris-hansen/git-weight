@@ -260,7 +260,7 @@ pub fn resolveTarget(
     var best_size: u64 = 0;
     var it = path_map.paths.iterator();
     while (it.next()) |e| {
-        if (!std.mem.eql(u8, e.value_ptr.*, target)) continue;
+        if (!std.mem.eql(u8, e.value_ptr.rep, target)) continue;
         const inf = store.info(e.key_ptr) catch continue;
         if (best == null or inf.size > best_size) {
             best = e.key_ptr.*;

@@ -8,6 +8,8 @@ const refs_analysis = @import("../analysis/refs.zig");
 const explain_mod = @import("../analysis/explain.zig");
 const changed_mod = @import("../analysis/changed.zig");
 const check_mod = @import("../analysis/check.zig");
+const dupes_mod = @import("../analysis/dupes.zig");
+const growth_mod = @import("../analysis/growth.zig");
 const object_id_mod = @import("../git/object_id.zig");
 
 pub const WriteError = std.Io.Writer.Error;
@@ -249,7 +251,7 @@ pub fn printObjects(jw: *JsonWriter, stats: *const objects_mod.ObjectStats) Writ
     try jw.w.writeByte('\n');
 }
 
-pub fn printPacks(jw: *JsonWriter, packs: []const packs_mod.PackInfo) WriteError!void {
+pub fn printPacks(jw: *JsonWriter, packs: []const packs_mod.PackInfo, summary: *const packs_mod.PacksSummary) WriteError!void {
     try jw.beginObject();
     try jw.field("packs");
     try jw.beginArray();
@@ -262,9 +264,65 @@ pub fn printPacks(jw: *JsonWriter, packs: []const packs_mod.PackInfo) WriteError
         try jw.writeU64(p.object_count);
         try jw.field("pack_bytes");
         try jw.writeU64(p.pack_bytes);
+        try jw.field("delta_count");
+        try jw.writeU64(p.delta_count);
+        try jw.field("max_delta_depth");
+        try jw.writeU64(p.max_delta_depth);
+        try jw.field("mean_delta_depth");
+        try jw.w.print("{d:.2}", .{p.meanDeltaDepth()});
+        try jw.field("delta_logical_bytes");
+        try jw.writeU64(p.delta_logical_bytes);
+        try jw.field("delta_physical_bytes");
+        try jw.writeU64(p.delta_physical_bytes);
         try jw.endObject();
     }
     try jw.endArray();
+
+    try jw.field("summary");
+    try jw.beginObject();
+    try jw.field("pack_count");
+    try jw.writeU64(summary.pack_count);
+    try jw.field("total_bytes");
+    try jw.writeU64(summary.total_bytes);
+    try jw.field("smallest_pack");
+    if (summary.smallest) |s| {
+        try jw.beginObject();
+        try jw.field("name");
+        try jw.writeString(s.name);
+        try jw.field("bytes");
+        try jw.writeU64(s.bytes);
+        try jw.endObject();
+    } else {
+        try jw.w.writeAll("null");
+    }
+    try jw.field("largest_pack");
+    if (summary.largest) |l| {
+        try jw.beginObject();
+        try jw.field("name");
+        try jw.writeString(l.name);
+        try jw.field("bytes");
+        try jw.writeU64(l.bytes);
+        try jw.endObject();
+    } else {
+        try jw.w.writeAll("null");
+    }
+    try jw.field("total_delta_count");
+    try jw.writeU64(summary.total_delta_count);
+    try jw.field("total_delta_logical_bytes");
+    try jw.writeU64(summary.total_delta_logical_bytes);
+    try jw.field("total_delta_physical_bytes");
+    try jw.writeU64(summary.total_delta_physical_bytes);
+    try jw.field("delta_ratio");
+    if (summary.total_delta_logical_bytes > 0) {
+        const ratio = @as(f64, @floatFromInt(summary.total_delta_physical_bytes)) / @as(f64, @floatFromInt(summary.total_delta_logical_bytes));
+        try jw.w.print("{d:.2}", .{ratio});
+    } else {
+        try jw.w.writeAll("null");
+    }
+    try jw.field("repack_hint");
+    if (summary.repack_hint) |h| try jw.writeString(h) else try jw.w.writeAll("null");
+    try jw.endObject();
+
     try jw.endObject();
     try jw.w.writeByte('\n');
 }
@@ -300,6 +358,63 @@ pub fn printRefs(jw: *JsonWriter, refs: []const refs_analysis.RefWeight) WriteEr
         try jw.endObject();
     }
     try jw.endArray();
+    try jw.endObject();
+    try jw.w.writeByte('\n');
+}
+
+pub fn printGrowth(jw: *JsonWriter, report: *const growth_mod.GrowthReport) WriteError!void {
+    try jw.beginObject();
+    try jw.field("buckets");
+    try jw.beginArray();
+    var mbuf: [8]u8 = undefined;
+    for (report.buckets) |b| {
+        try jw.beforeField();
+        try jw.beginObject();
+        try jw.field("month");
+        try jw.writeString(growth_mod.formatMonth(&mbuf, b.year * 12 + b.month - 1));
+        try jw.field("introduced_bytes");
+        try jw.writeU64(b.introduced_bytes);
+        try jw.field("cumulative_bytes");
+        try jw.writeU64(b.cumulative_bytes);
+        try jw.endObject();
+    }
+    try jw.endArray();
+    try jw.field("total_introduced_bytes");
+    try jw.writeU64(report.total_introduced_bytes);
+    try jw.endObject();
+    try jw.w.writeByte('\n');
+}
+
+pub fn printDupes(jw: *JsonWriter, report: *const dupes_mod.DupesReport) WriteError!void {
+    try jw.beginObject();
+    try jw.field("dupes");
+    try jw.beginArray();
+    for (report.groups) |g| {
+        try jw.beforeField();
+        try jw.beginObject();
+        var hbuf: [64]u8 = undefined;
+        try jw.field("oid");
+        try jw.writeString(g.id.hex(&hbuf));
+        try jw.field("size");
+        try jw.writeU64(g.size);
+        try jw.field("paths");
+        try jw.beginArray();
+        for (g.paths) |p| {
+            try jw.beforeField();
+            try jw.writeString(p);
+        }
+        try jw.endArray();
+        try jw.field("path_count");
+        try jw.writeU64(g.path_count);
+        try jw.field("truncated");
+        try writeBool(jw, g.truncated);
+        try jw.field("wasted_bytes");
+        try jw.writeU64(g.wasted_bytes);
+        try jw.endObject();
+    }
+    try jw.endArray();
+    try jw.field("total_wasted_bytes");
+    try jw.writeU64(report.total_wasted_bytes);
     try jw.endObject();
     try jw.w.writeByte('\n');
 }

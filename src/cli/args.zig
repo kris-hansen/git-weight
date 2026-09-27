@@ -12,6 +12,8 @@ pub const Command = enum {
     @"unreachable",
     changed,
     check,
+    dupes,
+    growth,
 };
 
 pub const ParseError = error{
@@ -41,6 +43,10 @@ pub const Options = struct {
     max_unreachable: ?u64 = null,
     /// For `check`: maximum largest single blob size in bytes.
     max_blob: ?u64 = null,
+    /// For `check`: maximum bytes introduced in the most recent month.
+    max_growth: ?u64 = null,
+    /// For `growth`: show only the last N month buckets.
+    months: ?usize = null,
     json: bool = false,
     limit: usize = 20,
     min_size: u64 = 0,
@@ -64,24 +70,28 @@ pub const usage_text =
     \\  summary      High-level repository report (default)
     \\  largest      Largest blobs in repository history
     \\  objects      Per-type object counts and logical sizes
-    \\  packs        Packfile statistics
+    \\  packs        Packfile statistics (delta chains, fragmentation)
     \\  explain      Explain why a path or object contributes to repository weight
     \\  refs         Refs retaining historical weight
     \\  unreachable  Unreachable objects reclaimable via git gc
     \\  changed      Whether a path changed between two revisions (CI)
     \\  check        Threshold checks for CI gating (see --max-* options)
+    \\  dupes        Duplicate content: identical blobs at multiple paths
+    \\  growth       Repository growth by calendar month
     \\
     \\Options:
     \\  --json             Machine-readable JSON output
-    \\  --limit N          Maximum entries to list (default 20; applies to largest/refs)
+    \\  --limit N          Maximum entries to list (default 20; applies to largest/refs/dupes)
     \\  --base REF         Base revision for 'changed' (default HEAD~1)
     \\  --to REF           Target revision for 'changed' (default HEAD)
     \\  --exit-code        For 'changed': exit 1 when changed, 0 when unchanged
     \\  --min-size SIZE    Only include blobs at least SIZE (e.g. 10MB, 500KiB)
+    \\  --months N         For 'growth': show only the last N month buckets
     \\  --max-size SIZE    For 'check': fail if total .git size exceeds SIZE
     \\  --max-historical SIZE  For 'check': fail if historical deleted bytes exceed SIZE
     \\  --max-unreachable SIZE For 'check': fail if gc-reclaimable bytes exceed SIZE
     \\  --max-blob SIZE    For 'check': fail if the largest blob exceeds SIZE
+    \\  --max-growth SIZE  For 'check': fail if the most recent month's new bytes exceed SIZE
     \\  --threads N        Worker thread count (default: detected CPU count)
     \\  --current          Only blobs present in the tree at HEAD
     \\  --historical       Only blobs not present in the tree at HEAD
@@ -193,6 +203,14 @@ pub fn parse(argv: []const []const u8) ParseError!Options {
                 i += 1;
                 if (i >= argv.len) return error.InvalidArguments;
                 opts.max_blob = parseSize(argv[i]) orelse return error.InvalidArguments;
+            } else if (std.mem.eql(u8, arg, "--max-growth")) {
+                i += 1;
+                if (i >= argv.len) return error.InvalidArguments;
+                opts.max_growth = parseSize(argv[i]) orelse return error.InvalidArguments;
+            } else if (std.mem.eql(u8, arg, "--months")) {
+                i += 1;
+                if (i >= argv.len) return error.InvalidArguments;
+                opts.months = std.fmt.parseUnsigned(usize, argv[i], 10) catch return error.InvalidArguments;
             } else if (std.mem.eql(u8, arg, "--threads")) {
                 i += 1;
                 if (i >= argv.len) return error.InvalidArguments;
@@ -237,7 +255,8 @@ pub fn parse(argv: []const []const u8) ParseError!Options {
     if (opts.command == .changed and opts.changed_path == null) return error.InvalidArguments;
     if (opts.command == .check and
         opts.max_size == null and opts.max_historical == null and
-        opts.max_unreachable == null and opts.max_blob == null)
+        opts.max_unreachable == null and opts.max_blob == null and
+        opts.max_growth == null)
         return error.InvalidArguments;
     if (opts.current_only and opts.historical_only) return error.InvalidArguments;
     return opts;
@@ -317,4 +336,20 @@ test "parse args" {
     try std.testing.expectError(error.InvalidArguments, parse(&.{"check"}));
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "check", "--max-size", "bogus" }));
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "check", "--max-blob" }));
+
+    const a9 = try parse(&.{ "check", "--max-growth", "10MB" });
+    try std.testing.expectEqual(@as(?u64, 10 * 1024 * 1024), a9.max_growth);
+    try std.testing.expect(a9.max_size == null);
+
+    const a10 = try parse(&.{ "growth", "--months", "6" });
+    try std.testing.expectEqual(Command.growth, a10.command);
+    try std.testing.expectEqual(@as(?usize, 6), a10.months);
+
+    const a11 = try parse(&.{ "dupes", "--limit", "5", "--min-size", "1KB" });
+    try std.testing.expectEqual(Command.dupes, a11.command);
+    try std.testing.expectEqual(@as(usize, 5), a11.limit);
+    try std.testing.expectEqual(@as(u64, 1024), a11.min_size);
+
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "growth", "--months" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "check", "--max-growth", "bogus" }));
 }

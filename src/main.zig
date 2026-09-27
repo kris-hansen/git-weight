@@ -16,6 +16,8 @@ const explain_mod = @import("analysis/explain.zig");
 const changed_mod = @import("analysis/changed.zig");
 const check_mod = @import("analysis/check.zig");
 const scan_mod = @import("analysis/scan.zig");
+const dupes_mod = @import("analysis/dupes.zig");
+const growth_mod = @import("analysis/growth.zig");
 
 const ExitCode = u8;
 pub const exit_success: ExitCode = 0;
@@ -79,6 +81,8 @@ comptime {
     _ = @import("analysis/changed.zig");
     _ = @import("analysis/check.zig");
     _ = @import("analysis/scan.zig");
+    _ = @import("analysis/dupes.zig");
+    _ = @import("analysis/growth.zig");
     _ = @import("platform/mmap.zig");
     _ = @import("platform/filesystem.zig");
 }
@@ -216,15 +220,18 @@ fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.I
             }
         },
         .packs => {
-            const list = packs.listPacks(&store, allocator) catch {
+            const list = packs.analyzePacks(&store, allocator) catch {
+                return fail(errw, exit_general, "error: failed to analyze packs");
+            };
+            const pack_summary = packs.buildSummary(list, allocator) catch {
                 return fail(errw, exit_general, "error: failed to analyze packs");
             };
             timer.mark("analysis: packs in", .{});
             if (opts.json) {
                 var jw: json.JsonWriter = .{ .w = w };
-                json.printPacks(&jw, list) catch return exit_general;
+                json.printPacks(&jw, list, &pack_summary) catch return exit_general;
             } else {
-                output.printPacks(w, list) catch return exit_general;
+                output.printPacks(w, list, &pack_summary) catch return exit_general;
             }
         },
         .@"unreachable" => {
@@ -278,6 +285,40 @@ fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.I
                 json.printRefs(&jw, weights) catch return exit_general;
             } else {
                 output.printRefs(w, weights) catch return exit_general;
+            }
+        },
+        .dupes => {
+            var path_map = paths.compute(&store, &refs, allocator) catch {
+                return fail(errw, exit_general, "error: failed to resolve paths");
+            };
+            defer path_map.deinit();
+            timer.mark("paths: {d} blob paths in", .{path_map.paths.count()});
+            var filter: largest.Filter = .all;
+            if (opts.current_only) filter = .current_only;
+            if (opts.historical_only) filter = .historical_only;
+            var report = dupes_mod.build(&store, &path_map, &refs, allocator, opts.limit, opts.min_size, filter) catch |err| {
+                return reportAnalysisError(errw, err);
+            };
+            defer report.deinit(allocator);
+            timer.mark("analysis: dupes in", .{});
+            if (opts.json) {
+                var jw: json.JsonWriter = .{ .w = w };
+                json.printDupes(&jw, &report) catch return exit_general;
+            } else {
+                output.printDupes(w, &report) catch return exit_general;
+            }
+        },
+        .growth => {
+            var report = growth_mod.build(&store, &refs, allocator, opts.months) catch |err| {
+                return reportAnalysisError(errw, err);
+            };
+            defer report.deinit(allocator);
+            timer.mark("analysis: growth in", .{});
+            if (opts.json) {
+                var jw: json.JsonWriter = .{ .w = w };
+                json.printGrowth(&jw, &report) catch return exit_general;
+            } else {
+                output.printGrowth(w, &report) catch return exit_general;
             }
         },
         .explain => {
@@ -360,7 +401,15 @@ fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.I
                 return reportAnalysisError(errw, err);
             };
             timer.mark("analysis: summary in", .{});
-            const check = check_mod.build(allocator, &s, opts.max_size, opts.max_historical, opts.max_unreachable, opts.max_blob) catch {
+            var growth_latest: ?u64 = null;
+            if (opts.max_growth != null) {
+                const g = growth_mod.build(&store, &refs, allocator, null) catch |err| {
+                    return reportAnalysisError(errw, err);
+                };
+                growth_latest = if (g.buckets.len > 0) g.buckets[g.buckets.len - 1].introduced_bytes else 0;
+                timer.mark("analysis: growth in", .{});
+            }
+            const check = check_mod.build(allocator, &s, opts.max_size, opts.max_historical, opts.max_unreachable, opts.max_blob, opts.max_growth, growth_latest) catch {
                 return fail(errw, exit_general, "error: out of memory");
             };
             if (opts.json) {

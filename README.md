@@ -75,17 +75,20 @@ Commands:
   summary      High-level repository report (default)
   largest      Largest blobs in repository history
   objects      Per-type object counts and logical sizes
-  packs        Packfile statistics
+  packs        Packfile statistics (delta chains, fragmentation)
   explain      Explain why a path or object contributes to repository weight
   refs         Refs retaining historical weight
   unreachable  Unreachable objects reclaimable via git gc
   changed      Whether a path changed between two revisions (CI)
   check        Threshold checks for CI gating (see --max-* options)
+  dupes        Duplicate content: identical blobs at multiple paths
+  growth       Repository growth by calendar month
 
 Options:
   --json             Machine-readable JSON output
-  --limit N          Maximum entries to list (default 20; applies to largest/refs)
+  --limit N          Maximum entries to list (default 20; applies to largest/refs/dupes)
   --min-size SIZE    Only include blobs at least SIZE (e.g. 10MB, 500KiB)
+  --months N         For 'growth': show only the last N month buckets
   --threads N        Worker thread count (default: CPU count)
   --base REF         Base revision for 'changed' (default HEAD~1)
   --to REF           Target revision for 'changed' (default HEAD)
@@ -94,8 +97,9 @@ Options:
   --max-historical SIZE  For 'check': fail if historical deleted bytes exceed SIZE
   --max-unreachable SIZE For 'check': fail if gc-reclaimable bytes exceed SIZE
   --max-blob SIZE    For 'check': fail if the largest blob exceeds SIZE
-  --current          Only blobs present in the tree at HEAD
-  --historical       Only blobs not present in the tree at HEAD
+  --max-growth SIZE  For 'check': fail if the most recent month's new bytes exceed SIZE
+  --current          Only blobs present in the tree at HEAD (largest/dupes)
+  --historical       Only blobs not present in the tree at HEAD (largest/dupes)
   --no-color         Disable colored output
   --verbose          Additional diagnostics on stderr
   --quiet            Suppress non-essential output
@@ -103,6 +107,58 @@ Options:
   --version          Print version and exit
   --help             Print help and exit
 ```
+
+### Pack forensics
+
+`git-weight packs` reports per-pack delta statistics (delta count, max/mean chain depth, physical bytes stored for delta objects versus their logical size) plus a fragmentation summary — pack count, smallest/largest pack, and a one-line repack hint when the pack set looks suboptimal:
+
+```text
+$ git-weight packs
+
+PACK                          OBJECTS     PHYSICAL SIZE
+pack-0ccfab66....pack         151         106 KB
+
+Delta compression
+  pack-0ccfab66....pack       66 deltas   max depth 4   mean 1.59   13.0 KB stored for 372 KB logical (3%)
+
+Pack fragmentation
+  Packs               1
+  Smallest            106 KB (pack-0ccfab66....pack)
+  Largest             106 KB (pack-0ccfab66....pack)
+```
+
+### Duplicate content
+
+`git-weight dupes` finds blobs with identical content (the same object id) living at two or more distinct paths — the copies past the first are pure overhead. Groups are sorted by reclaimable bytes (`size × (path count − 1)`) and list every path (up to 32 per blob, then a `+` truncated marker; `--json` sets `truncated: true` and the counts become lower bounds):
+
+```text
+$ git-weight dupes
+
+WASTED     SIZE       PATHS  OID
+195 KB     97.7 KB    3      3e63ec9
+  bak/data.bin
+  data-copy.bin
+  data.bin
+
+Total reclaimable if deduplicated: 195 KB across 1 group
+```
+
+`--current` counts only duplicate paths within the tree at HEAD (what you could reclaim today); the default covers all reachable history. With `--json`, output is `{"dupes": [{"oid", "size", "paths", "path_count", "truncated", "wasted_bytes"}], "total_wasted_bytes"}`.
+
+### Growth over time
+
+`git-weight growth` buckets every reachable commit by committer calendar month and attributes each blob's logical size to the month of its introducing commit — the earliest commit (by committer time) whose parents do not already contain the blob. The cumulative column is the running total of introduced bytes, so it measures how fast history accumulates weight (content that was later deleted still counts):
+
+```text
+$ git-weight growth --months 6
+
+MONTH      INTRODUCED   CUMULATIVE
+2026-04    12.4 MB      81.2 MB
+2026-05    3.10 MB      84.3 MB
+2026-06    900 KB       85.2 MB
+```
+
+`--months N` shows the most recent N buckets; `--json` emits `{"buckets": [{"month", "introduced_bytes", "cumulative_bytes"}], "total_introduced_bytes"}`.
 
 Example:
 
@@ -174,7 +230,14 @@ git-weight check \
     --max-blob 20MB
 ```
 
-Each threshold compares against a value from the summary report: `--max-size` against the total `.git` size, `--max-historical` against bytes of deleted-at-HEAD content, `--max-unreachable` against physical bytes reclaimable via `git gc`, and `--max-blob` against the largest single blob. At least one threshold is required. With `--json`, results are reported as `{"repository": {...}, "thresholds": [{"name", "limit", "actual", "ok"}], "ok": ...}` for machine-readable CI logs.
+Each threshold compares against a value from the summary report: `--max-size` against the total `.git` size, `--max-historical` against bytes of deleted-at-HEAD content, `--max-unreachable` against physical bytes reclaimable via `git gc`, and `--max-blob` against the largest single blob. `--max-growth SIZE` fails when the most recent calendar month's introduced bytes (the same attribution as `git-weight growth`) exceed SIZE:
+
+```sh
+# Fail CI if last month added more than 10 MB to history.
+git-weight check --max-growth 10MB
+```
+
+At least one threshold is required. With `--json`, results are reported as `{"repository": {...}, "thresholds": [{"name", "limit", "actual", "ok"}], "ok": ...}` for machine-readable CI logs.
 
 ### Terminology
 
