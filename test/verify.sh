@@ -290,6 +290,94 @@ d = json.load(sys.stdin)
 assert d['objects']['blob']['count'] == 0
 print('ok: empty repo')"
 
+# --- fixture: sha256 object format ---------------------------------------------
+# Guarded: git gained --object-format=sha256 in 2.29, but some distro builds
+# lack it. Skips cleanly when unsupported.
+REPO="$FIXTURES/sha256"
+if git init -q -b main --object-format=sha256 "$REPO" 2>/dev/null; then
+    cd "$REPO"
+    git config user.email test@example.com
+    git config user.name Test
+    head -c 1000000 /dev/urandom > big.bin
+    echo small > README.md
+    git add -A && git commit -qm one
+    head -c 500000 /dev/urandom > historical.bin
+    git add -A && git commit -qm two
+    git rm -q historical.bin
+    git commit -qm "remove historical.bin"
+    git tag -a v1.0 -m "release"
+    git gc -q
+
+    # Pack idx parsing (32-byte oids, 64-byte checksum trailer): counts and
+    # logical sizes must match the oracle.
+    "$GW" objects --json > "$FIXTURES/sha256_objects.json"
+    python3 - "$FIXTURES/sha256_objects.json" <<'PYEOF'
+import json, subprocess, sys
+
+ours = json.load(open(sys.argv[1]))["objects"]
+out = subprocess.check_output(
+    ["git", "cat-file", "--batch-all-objects",
+     "--batch-check=%(objecttype) %(objectsize)"]).decode()
+oracle = {}
+for line in out.splitlines():
+    t, size = line.split()
+    e = oracle.setdefault(t, [0, 0])
+    e[0] += 1
+    e[1] += int(size)
+for t in ("blob", "tree", "commit", "tag"):
+    o = oracle.get(t, [0, 0])
+    got = ours[t]
+    if got["count"] != o[0] or got["logical_bytes"] != o[1]:
+        print(f"FAIL sha256 {t}: oracle {o}, got {got}", file=sys.stderr)
+        sys.exit(1)
+print("ok: sha256 objects match git cat-file oracle (packed)")
+PYEOF
+
+    # explain by path, full 64-hex oid, and prefix all resolve.
+    "$GW" explain README.md --json > "$FIXTURES/sha256_explain.json"
+    python3 - "$FIXTURES/sha256_explain.json" <<'PYEOF'
+import json, sys
+
+d = json.load(open(sys.argv[1]))
+if d["type"] != "blob" or not d["reachable"]:
+    print(f"FAIL: sha256 explain README.md: {d}", file=sys.stderr)
+    sys.exit(1)
+if "refs/heads/main" not in d["retained_by"] or "refs/tags/v1.0" not in d["retained_by"]:
+    print(f"FAIL: sha256 retained_by: {d['retained_by']}", file=sys.stderr)
+    sys.exit(1)
+if d["introduced"] is None:
+    print(f"FAIL: sha256 introduced missing: {d}", file=sys.stderr)
+    sys.exit(1)
+print("ok: sha256 explain by path (json)")
+PYEOF
+
+    README_OID=$(git rev-parse 'HEAD:README.md')
+    case "$README_OID" in
+        ????????????????????????????????????????????????????????????????*) ;;
+        *) fail "sha256 repo did not produce a 64-hex oid: $README_OID" ;;
+    esac
+    "$GW" explain "$README_OID" --json | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+assert d['logical_bytes'] == 6, d
+print('ok: sha256 explain by full oid')"
+    SHORT_OID=$(printf '%s' "$README_OID" | cut -c1-8)
+    "$GW" explain "$SHORT_OID" --json | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+assert d['logical_bytes'] == 6, d
+print('ok: sha256 explain by abbreviated oid')"
+
+    "$GW" largest --limit 5 --json | python3 -c "
+import json, sys
+blobs = json.load(sys.stdin)['blobs']
+assert blobs[0]['logical_bytes'] == 1000000, blobs
+assert any(b['status'] == 'historical' for b in blobs), blobs
+print('ok: sha256 largest (packed)')"
+else
+    echo "skip: git lacks --object-format=sha256"
+fi
+
 # --- bare repository and linked worktree --------------------------------------
 cd "$FIXTURES/packed"
 git clone -q --bare . "$FIXTURES/bare.git"

@@ -65,6 +65,7 @@ comptime {
     _ = @import("git/pack/pack.zig");
     _ = @import("git/pack/delta.zig");
     _ = @import("git/commit.zig");
+    _ = @import("git/commit_graph.zig");
     _ = @import("git/tree.zig");
     _ = @import("git/tag.zig");
     _ = @import("analysis/summary.zig");

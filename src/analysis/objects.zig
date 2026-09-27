@@ -7,6 +7,7 @@ const loose_mod = @import("../git/loose.zig");
 const inflate = @import("../git/inflate.zig");
 const pack_mod = @import("../git/pack/pack.zig");
 const index_mod = @import("../git/pack/index.zig");
+const commit_graph_mod = @import("../git/commit_graph.zig");
 const mmap = @import("../platform/mmap.zig");
 
 pub const StoreError = error{
@@ -63,6 +64,13 @@ pub const ObjectStore = struct {
     /// Owned copy of the objects directory path, for lazy loose probes.
     objects_dir: []const u8,
     indexed: bool,
+    /// Parsed commit-graph, when a valid file exists at
+    /// objects/info/commit-graph. Null on any problem (missing file, split
+    /// chain, checksum mismatch); walks fall back to parsing commit
+    /// objects, so this is purely an accelerator.
+    graph: ?commit_graph_mod.CommitGraph = null,
+    /// Backing mapping for `graph`.
+    graph_file: ?mmap.MappedFile = null,
     /// Worker thread count for parallel passes; 1 = single-threaded.
     threads: usize = 1,
 
@@ -83,7 +91,21 @@ pub const ObjectStore = struct {
         errdefer store.deinit();
 
         try store.openPacks(objects_dir);
+        store.openGraph(objects_dir);
         return store;
+    }
+
+    /// Best-effort commit-graph load; any failure leaves `graph` null.
+    fn openGraph(self: *ObjectStore, objects_dir: []const u8) void {
+        var gbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&gbuf, "{s}/info/commit-graph", .{objects_dir}) catch return;
+        var mf = mmap.MappedFile.init(path) catch return;
+        if (commit_graph_mod.CommitGraph.init(mf.data, self.algorithm)) |g| {
+            self.graph_file = mf;
+            self.graph = g;
+        } else {
+            mf.deinit();
+        }
     }
 
     /// Build the full oid -> location index (loose scan + pack entries).
@@ -185,6 +207,7 @@ pub const ObjectStore = struct {
     }
 
     pub fn deinit(self: *ObjectStore) void {
+        if (self.graph_file) |*gf| gf.deinit();
         for (self.packs.items) |*pf| {
             pf.mapped_pack.deinit();
             pf.mapped_index.deinit();

@@ -13,7 +13,6 @@ pub const Tag = struct {
 
 /// Parse an annotated tag payload (zero-copy views into `data`).
 pub fn parse(data: []const u8, algorithm: object_id.HashAlgorithm) TagError!Tag {
-    _ = algorithm; // oid width currently fixed at SHA-1; kept for SHA-256
     var obj: ?object_id.ObjectId = null;
     var obj_type: ?git_object.ObjectType = null;
     var name: []const u8 = "";
@@ -25,7 +24,7 @@ pub fn parse(data: []const u8, algorithm: object_id.HashAlgorithm) TagError!Tag 
         const line = data[pos..line_end];
         if (line.len == 0) break;
         if (std.mem.startsWith(u8, line, "object ")) {
-            obj = object_id.ObjectId.fromHex(line[7..]) catch return error.InvalidTag;
+            obj = object_id.ObjectId.parseHex(line[7..], algorithm) catch return error.InvalidTag;
         } else if (std.mem.startsWith(u8, line, "type ")) {
             obj_type = git_object.ObjectType.fromName(line[5..]);
         } else if (std.mem.startsWith(u8, line, "tag ")) {
@@ -51,4 +50,15 @@ test "parse tag" {
     try std.testing.expectEqualStrings("v1.0", t.name);
     try std.testing.expectEqual(git_object.ObjectType.commit, t.object_type);
     try std.testing.expectEqualStrings("Alice <a@b.c> 1552272000 +0000", t.tagger);
+}
+
+test "parse sha256 tag" {
+    const obj_hex = "a29495cd7ca6ee34e358698f44f6e334b497c284a192e8e8fba4c09700b6f254";
+    const payload = "object " ++ obj_hex ++ "\ntype commit\ntag v2.0\ntagger Alice <a@b.c> 1552272000 +0000\n\nmessage\n";
+    const t = try parse(payload, .sha256);
+    try std.testing.expectEqual(object_id.HashAlgorithm.sha256, t.object.algorithm);
+    try std.testing.expectEqualStrings("v2.0", t.name);
+
+    const wrong = parse(payload, .sha1);
+    try std.testing.expectError(error.InvalidTag, wrong);
 }

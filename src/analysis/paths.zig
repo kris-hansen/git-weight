@@ -184,13 +184,17 @@ pub fn compute(
     defer tag_extra.deinit(allocator);
 
     // Sequential commit-graph walk: collect every reachable commit and its
-    // root tree. Reads no trees; cheap relative to the tree walk.
+    // root tree. Commits covered by the commit-graph file are resolved from
+    // it (no payload inflation); anything absent falls back to object
+    // parsing below. Reads no trees; cheap relative to the tree walk.
     var visited: std.HashMapUnmanaged(object_id.ObjectId, void, object_id.ObjectId.Context, 80) = .empty;
     defer visited.deinit(allocator);
     var stack: std.ArrayList(object_id.ObjectId) = .empty;
     defer stack.deinit(allocator);
     var commits: std.ArrayList(CommitTree) = .empty;
     defer commits.deinit(allocator);
+    var graph_parent_buf: std.ArrayList(u32) = .empty;
+    defer graph_parent_buf.deinit(allocator);
 
     for (refs.refs.items) |r| {
         {
@@ -220,6 +224,27 @@ pub fn compute(
     }
 
     while (stack.pop()) |id| {
+        // Commit-graph fast path: same parent list, same push order, so the
+        // DFS pop order (and thus everything downstream) is identical to
+        // the payload-parse path.
+        if (store.graph) |*g| {
+            if (g.lookup(&id)) |pos| {
+                const resolved = g.entry(pos, allocator, &graph_parent_buf) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.InvalidGraph => null,
+                };
+                if (resolved) |ent| {
+                    try commits.append(allocator, .{ .id = id, .tree = ent.tree });
+                    for (ent.parents) |pp| {
+                        const p = g.oidAt(pp);
+                        if (visited.contains(p)) continue;
+                        try visited.put(allocator, p, {});
+                        try stack.append(allocator, p);
+                    }
+                    continue;
+                }
+            }
+        }
         _ = bfs_scratch.reset(.retain_capacity);
         const payload = store.readPayload(bfs_scratch.allocator(), &id) catch continue;
         if (payload.object_type != .commit) continue;
