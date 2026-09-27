@@ -69,27 +69,68 @@ pub fn discover(allocator: std.mem.Allocator, start_path: []const u8) DiscoverEr
     // `abs` comes from realpath: absolute, symlink-free, normalized.
     var path: []const u8 = abs;
 
-    while (true) {
+    const repo = while (true) {
         // A `.git` entry (directory or worktree pointer file)?
         var join_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const dotgit = std.fmt.bufPrint(&join_buf, "{s}/.git", .{path}) catch return error.Unexpected;
         if (statPath(dotgit)) |st| {
             switch (st.kind) {
-                .directory => return try initNormal(allocator, path, dotgit),
-                .file, .sym_link => return initFromGitFile(allocator, path, dotgit),
+                .directory => break try initNormal(allocator, path, dotgit),
+                .file, .sym_link => break try initFromGitFile(allocator, path, dotgit),
                 else => {},
             }
         }
 
         // Bare repository layout at this level?
         if (isGitLayout(path)) {
-            return initBare(allocator, path);
+            break try initBare(allocator, path);
         }
 
         const parent = std.fs.path.dirname(path) orelse return error.NotARepository;
         if (parent.len == path.len) return error.NotARepository;
         path = parent;
+    };
+
+    var found = repo;
+    // The object format lives in the shared config; it must be known before
+    // the store opens any pack index or loose object path.
+    found.hash_algorithm = detectHashAlgorithm(allocator, found.common_dir);
+    return found;
+}
+
+/// Read the object format from `<common_dir>/config`
+/// (`extensions.objectformat = sha256`). Defaults to SHA-1 when the config
+/// file is missing, unparsable, or carries no such extension. Section and
+/// key names are case-insensitive, as in Git.
+fn detectHashAlgorithm(allocator: std.mem.Allocator, common_dir: []const u8) object_id.HashAlgorithm {
+    var pbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const config_path = std.fmt.bufPrint(&pbuf, "{s}/config", .{common_dir}) catch return .sha1;
+    const raw = std.Io.Dir.cwd().readFileAlloc(io(), config_path, allocator, std.Io.Limit.limited(1 << 20)) catch return .sha1;
+    defer allocator.free(raw);
+
+    var algorithm: object_id.HashAlgorithm = .sha1;
+    var in_extensions = false;
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (line.len == 0 or line[0] == '#' or line[0] == ';') continue;
+        if (line[0] == '[') {
+            const end = std.mem.indexOfScalar(u8, line, ']') orelse continue;
+            // A subsection looks like `[extensions "x"]`; the bare section
+            // name ends at the first quote or bracket.
+            const name_end = std.mem.indexOfAny(u8, line[1..end], "\" ") orelse end - 1;
+            const section = line[1 .. 1 + name_end];
+            in_extensions = std.ascii.eqlIgnoreCase(section, "extensions");
+            continue;
+        }
+        if (!in_extensions) continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = std.mem.trim(u8, line[0..eq], " \t");
+        if (!std.ascii.eqlIgnoreCase(key, "objectformat")) continue;
+        const value = std.mem.trim(u8, line[eq + 1 ..], " \t\"");
+        if (std.ascii.eqlIgnoreCase(value, "sha256")) algorithm = .sha256;
     }
+    return algorithm;
 }
 
 fn initNormal(allocator: std.mem.Allocator, worktree: []const u8, git_dir: []const u8) DiscoverError!Repository {

@@ -16,7 +16,9 @@ case "$GW" in
 esac
 [ -x "$GW" ] || { echo "git-weight binary not found: $GW" >&2; exit 1; }
 FIXTURES="$(mktemp -d)"
-trap 'rm -rf "$FIXTURES"' EXIT
+# cd out first: removing a directory tree that contains the shell's own
+# working directory fails with EPERM on some platforms (macOS runners).
+trap 'cd /; rm -rf "$FIXTURES"' EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -244,18 +246,20 @@ import json, subprocess, sys
 blobs = json.load(open(sys.argv[1]))["blobs"]
 out = subprocess.check_output(
     ["git", "rev-list", "--objects", "--all"]).decode(errors="replace")
+# Full oids as keys: 7-hex prefixes collide often enough at this object
+# count (birthday paradox) to flake the check.
 oid_paths = {}
 for line in out.splitlines():
     parts = line.split(" ", 1)
     if len(parts) == 2:
-        oid_paths[parts[0][:7]] = parts[1]
+        oid_paths[parts[0]] = parts[1]
 missing = 0
 for b in blobs:
     p = b["path"]
-    if p is None or oid_paths.get(b["oid"][:7]) != p:
+    if p is None or oid_paths.get(b["oid"]) != p:
         missing += 1
         if missing <= 3:
-            print(f"bad path: {b['oid'][:7]} tool={p} oracle={oid_paths.get(b['oid'][:7])}",
+            print(f"bad path: {b['oid'][:7]} tool={p} oracle={oid_paths.get(b['oid'])}",
                   file=sys.stderr)
 if missing:
     print(f"FAIL: {missing} blobs with missing/incorrect path", file=sys.stderr)
@@ -289,6 +293,94 @@ import json, sys
 d = json.load(sys.stdin)
 assert d['objects']['blob']['count'] == 0
 print('ok: empty repo')"
+
+# --- fixture: sha256 object format ---------------------------------------------
+# Guarded: git gained --object-format=sha256 in 2.29, but some distro builds
+# lack it. Skips cleanly when unsupported.
+REPO="$FIXTURES/sha256"
+if git init -q -b main --object-format=sha256 "$REPO" 2>/dev/null; then
+    cd "$REPO"
+    git config user.email test@example.com
+    git config user.name Test
+    head -c 1000000 /dev/urandom > big.bin
+    echo small > README.md
+    git add -A && git commit -qm one
+    head -c 500000 /dev/urandom > historical.bin
+    git add -A && git commit -qm two
+    git rm -q historical.bin
+    git commit -qm "remove historical.bin"
+    git tag -a v1.0 -m "release"
+    git gc -q
+
+    # Pack idx parsing (32-byte oids, 64-byte checksum trailer): counts and
+    # logical sizes must match the oracle.
+    "$GW" objects --json > "$FIXTURES/sha256_objects.json"
+    python3 - "$FIXTURES/sha256_objects.json" <<'PYEOF'
+import json, subprocess, sys
+
+ours = json.load(open(sys.argv[1]))["objects"]
+out = subprocess.check_output(
+    ["git", "cat-file", "--batch-all-objects",
+     "--batch-check=%(objecttype) %(objectsize)"]).decode()
+oracle = {}
+for line in out.splitlines():
+    t, size = line.split()
+    e = oracle.setdefault(t, [0, 0])
+    e[0] += 1
+    e[1] += int(size)
+for t in ("blob", "tree", "commit", "tag"):
+    o = oracle.get(t, [0, 0])
+    got = ours[t]
+    if got["count"] != o[0] or got["logical_bytes"] != o[1]:
+        print(f"FAIL sha256 {t}: oracle {o}, got {got}", file=sys.stderr)
+        sys.exit(1)
+print("ok: sha256 objects match git cat-file oracle (packed)")
+PYEOF
+
+    # explain by path, full 64-hex oid, and prefix all resolve.
+    "$GW" explain README.md --json > "$FIXTURES/sha256_explain.json"
+    python3 - "$FIXTURES/sha256_explain.json" <<'PYEOF'
+import json, sys
+
+d = json.load(open(sys.argv[1]))
+if d["type"] != "blob" or not d["reachable"]:
+    print(f"FAIL: sha256 explain README.md: {d}", file=sys.stderr)
+    sys.exit(1)
+if "refs/heads/main" not in d["retained_by"] or "refs/tags/v1.0" not in d["retained_by"]:
+    print(f"FAIL: sha256 retained_by: {d['retained_by']}", file=sys.stderr)
+    sys.exit(1)
+if d["introduced"] is None:
+    print(f"FAIL: sha256 introduced missing: {d}", file=sys.stderr)
+    sys.exit(1)
+print("ok: sha256 explain by path (json)")
+PYEOF
+
+    README_OID=$(git rev-parse 'HEAD:README.md')
+    case "$README_OID" in
+        ????????????????????????????????????????????????????????????????*) ;;
+        *) fail "sha256 repo did not produce a 64-hex oid: $README_OID" ;;
+    esac
+    "$GW" explain "$README_OID" --json | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+assert d['logical_bytes'] == 6, d
+print('ok: sha256 explain by full oid')"
+    SHORT_OID=$(printf '%s' "$README_OID" | cut -c1-8)
+    "$GW" explain "$SHORT_OID" --json | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+assert d['logical_bytes'] == 6, d
+print('ok: sha256 explain by abbreviated oid')"
+
+    "$GW" largest --limit 5 --json | python3 -c "
+import json, sys
+blobs = json.load(sys.stdin)['blobs']
+assert blobs[0]['logical_bytes'] == 1000000, blobs
+assert any(b['status'] == 'historical' for b in blobs), blobs
+print('ok: sha256 largest (packed)')"
+else
+    echo "skip: git lacks --object-format=sha256"
+fi
 
 # --- bare repository and linked worktree --------------------------------------
 cd "$FIXTURES/packed"
@@ -720,5 +812,270 @@ CODE=$?
 set -e
 [ "$CODE" -eq 2 ] || fail "expected exit 2 for --max-size without value, got $CODE"
 echo "ok: check error exit codes (2 no thresholds, 2 missing value)"
+
+# --- dupes: duplicate content detection (spec §36) -------------------------------
+REPO="$FIXTURES/dupes"
+mkdir -p "$REPO"
+cd "$REPO"
+git init -q -b main
+git config user.email test@example.com
+git config user.name Test
+head -c 100000 /dev/urandom > shared.bin
+mkdir -p keep bak
+cp shared.bin keep/copy.bin
+cp shared.bin bak/old.bin
+git add -A && git commit -qm "add copies"
+git rm -q -r bak
+git commit -qm "remove bak"
+
+# A blob living at 3 paths across HEAD+history: one group, sorted paths,
+# wasted = size * (count - 1).
+SHARED_OID=$(git rev-parse HEAD:shared.bin)
+"$GW" dupes --json > "$FIXTURES/dupes.json"
+python3 - "$FIXTURES/dupes.json" "$SHARED_OID" <<'PYEOF'
+import json, subprocess, sys
+
+d = json.load(open(sys.argv[1]))
+gs = d["dupes"]
+if len(gs) != 1:
+    print(f"FAIL: expected 1 group, got {gs}", file=sys.stderr)
+    sys.exit(1)
+g = gs[0]
+if g["oid"] != sys.argv[2]:
+    print(f"FAIL: oid {g['oid']} != {sys.argv[2]}", file=sys.stderr)
+    sys.exit(1)
+if g["size"] != 100000 or g["path_count"] != 3 or g["wasted_bytes"] != 200000:
+    print(f"FAIL: bad group: {g}", file=sys.stderr)
+    sys.exit(1)
+if g["paths"] != sorted(g["paths"]) or set(g["paths"]) != {
+        "shared.bin", "keep/copy.bin", "bak/old.bin"}:
+    print(f"FAIL: bad paths: {g['paths']}", file=sys.stderr)
+    sys.exit(1)
+if g["truncated"] is not False or d["total_wasted_bytes"] != 200000:
+    print(f"FAIL: bad flags: {d}", file=sys.stderr)
+    sys.exit(1)
+# Oracle: every listed path existed at some point (git log name-only lists
+# paths touched by any commit; rev-list --objects collapses duplicate oids
+# to a single path, so it cannot serve here).
+out = subprocess.check_output(
+    ["git", "log", "--all", "--pretty=format:", "--name-only"]).decode()
+have = {p for p in out.splitlines() if p}
+for p in g["paths"]:
+    if p not in have:
+        print(f"FAIL: path {p} never existed", file=sys.stderr)
+        sys.exit(1)
+print("ok: dupes group (oid, size, 3 sorted paths, wasted bytes)")
+PYEOF
+
+# --current counts only HEAD paths; --historical excludes blobs still at HEAD.
+"$GW" dupes --current --json | python3 -c "
+import json, sys
+g = json.load(sys.stdin)['dupes'][0]
+assert g['path_count'] == 2 and g['wasted_bytes'] == 100000, g
+assert g['paths'] == ['keep/copy.bin', 'shared.bin'], g
+print('ok: dupes --current limits to HEAD paths')"
+"$GW" dupes --historical --json | python3 -c "
+import json, sys
+assert json.load(sys.stdin)['dupes'] == [], 'blob still at HEAD, no historical groups'
+print('ok: dupes --historical empty for current blob')"
+
+# A fully removed dupe pair shows up under --historical.
+head -c 50000 /dev/urandom > gone.bin
+mkdir -p dup
+cp gone.bin dup/x.bin
+cp gone.bin dup/y.bin
+git add -A && git commit -qm "add gone pair"
+git rm -q -r dup gone.bin
+git commit -qm "remove gone pair"
+"$GW" dupes --historical --json | python3 -c "
+import json, sys
+gs = json.load(sys.stdin)['dupes']
+assert len(gs) == 1 and gs[0]['size'] == 50000 and gs[0]['path_count'] == 3, gs
+assert gs[0]['wasted_bytes'] == 100000, gs
+assert sorted(gs[0]['paths']) == ['dup/x.bin', 'dup/y.bin', 'gone.bin'], gs
+print('ok: dupes --historical finds fully removed dupe group')"
+
+# --min-size and --limit behave.
+"$GW" dupes --min-size 1MB --json | python3 -c "
+import json, sys
+assert json.load(sys.stdin)['dupes'] == []
+print('ok: dupes --min-size filters small groups')"
+"$GW" dupes --limit 1 --json | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+assert len(d['dupes']) == 1
+assert d['total_wasted_bytes'] == d['dupes'][0]['wasted_bytes']
+print('ok: dupes --limit')"
+"$GW" dupes | grep -q "Total reclaimable" || fail "dupes human output missing total"
+echo "ok: dupes human output"
+
+# --- growth: repository growth by month (spec §36) ------------------------------
+REPO="$FIXTURES/growth"
+mkdir -p "$REPO"
+cd "$REPO"
+git init -q -b main
+git config user.email test@example.com
+git config user.name Test
+commit_at() {
+    # commit_at <date> <file> <size>
+    export GIT_COMMITTER_DATE="$1T12:00:00+00:00" GIT_AUTHOR_DATE="$1T12:00:00+00:00"
+    head -c "$3" /dev/urandom > "$2"
+    git add -A && git commit -qm "add $2"
+    unset GIT_COMMITTER_DATE GIT_AUTHOR_DATE
+}
+commit_at 2020-01-15 jan.bin 1000000
+commit_at 2020-03-15 mar.bin 2000000
+# A modification in April replaces jan.bin: only the new blob counts.
+commit_at 2020-04-10 jan.bin 4000000
+commit_at 2021-02-15 feb.bin 8000000
+
+"$GW" growth --json > "$FIXTURES/growth.json"
+python3 - "$FIXTURES/growth.json" <<'PYEOF'
+import json, sys
+
+d = json.load(open(sys.argv[1]))
+buckets = {b["month"]: b for b in d["buckets"]}
+want = {
+    "2020-01": (1000000, 1000000),
+    "2020-03": (2000000, 3000000),
+    "2020-04": (4000000, 7000000),
+    "2021-02": (8000000, 15000000),
+}
+if set(buckets) != set(want):
+    print(f"FAIL: months {sorted(buckets)} != {sorted(want)}", file=sys.stderr)
+    sys.exit(1)
+for m, (intro, cum) in want.items():
+    b = buckets[m]
+    if b["introduced_bytes"] != intro or b["cumulative_bytes"] != cum:
+        print(f"FAIL: {m}: got {b}, want intro={intro} cum={cum}", file=sys.stderr)
+        sys.exit(1)
+if d["total_introduced_bytes"] != 15000000:
+    print(f"FAIL: total {d['total_introduced_bytes']}", file=sys.stderr)
+    sys.exit(1)
+print("ok: growth buckets (introduced + cumulative by month)")
+PYEOF
+
+"$GW" growth --months 2 --json | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+assert [b['month'] for b in d['buckets']] == ['2020-04', '2021-02'], d
+assert d['total_introduced_bytes'] == 15000000, d
+print('ok: growth --months 2 (last buckets, full total)')"
+"$GW" growth | grep -q "CUMULATIVE" || fail "growth human output missing table"
+echo "ok: growth human output"
+
+# check --max-growth gates on the most recent month (2021-02: 8 MB).
+set +e
+"$GW" check --max-growth 3MB >/dev/null 2>&1
+CODE=$?
+set -e
+[ "$CODE" -eq 6 ] || fail "expected exit 6 for --max-growth 3MB, got $CODE"
+set +e
+"$GW" check --max-growth 10MB >/dev/null 2>&1
+CODE=$?
+set -e
+[ "$CODE" -eq 0 ] || fail "expected exit 0 for --max-growth 10MB, got $CODE"
+echo "ok: check --max-growth exit codes (6 over, 0 under)"
+"$GW" check --max-growth 3MB --json 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+ts = {t['name']: t for t in d['thresholds']}
+assert set(ts) == {'max-growth'}, d
+assert ts['max-growth']['actual'] == 8000000 and ts['max-growth']['ok'] is False, d
+assert d['ok'] is False
+print('ok: check --max-growth --json (actual = latest month)')"
+
+# --- deep pack stats (spec §6.6) -------------------------------------------------
+cd "$FIXTURES/delta"
+
+# Per-pack delta stats must match the git verify-pack oracle.
+"$GW" packs --json > "$FIXTURES/packs.json"
+python3 - "$FIXTURES/packs.json" <<PYEOF
+import json, sys
+
+d = json.load(open(sys.argv[1]))
+packs = d["packs"]
+if len(packs) != 1:
+    print(f"FAIL: expected 1 pack, got {len(packs)}", file=sys.stderr)
+    sys.exit(1)
+p = packs[0]
+if p["delta_count"] != $DELTA_COUNT:
+    print(f"FAIL: delta_count {p['delta_count']} != oracle $DELTA_COUNT",
+          file=sys.stderr)
+    sys.exit(1)
+if p["max_delta_depth"] < 1 or p["mean_delta_depth"] < 1:
+    print(f"FAIL: bad delta depths: {p}", file=sys.stderr)
+    sys.exit(1)
+if p["delta_physical_bytes"] == 0 or p["delta_physical_bytes"] >= p["pack_bytes"]:
+    print(f"FAIL: bad delta physical bytes: {p}", file=sys.stderr)
+    sys.exit(1)
+if p["delta_logical_bytes"] <= p["delta_physical_bytes"]:
+    print(f"FAIL: delta logical should exceed physical: {p}", file=sys.stderr)
+    sys.exit(1)
+# Existing fields must be unchanged.
+if set(("name", "objects", "pack_bytes")) - set(p):
+    print(f"FAIL: missing base pack fields: {p}", file=sys.stderr)
+    sys.exit(1)
+s = d["summary"]
+if s["pack_count"] != 1 or s["total_delta_count"] != $DELTA_COUNT:
+    print(f"FAIL: bad summary: {s}", file=sys.stderr)
+    sys.exit(1)
+if s["repack_hint"] is not None:
+    print(f"FAIL: single healthy pack should not hint repack: {s}", file=sys.stderr)
+    sys.exit(1)
+print("ok: packs --json delta stats match verify-pack oracle")
+PYEOF
+"$GW" packs | grep -q "Delta compression" || fail "packs human output missing delta section"
+"$GW" packs | grep -q "Pack fragmentation" || fail "packs human output missing fragmentation section"
+echo "ok: packs human output (delta + fragmentation sections)"
+
+# Fragmentation: many small packs trigger the repack hint. Packs are built
+# with one `git pack-objects` call per blob: modern `git repack` consolidates
+# incremental packs on its own schedule (observed mid-test on git 2.55 CI),
+# which would make this fixture's layout nondeterministic.
+REPO="$FIXTURES/multipack"
+mkdir -p "$REPO"
+cd "$REPO"
+git init -q -b main
+git config user.email test@example.com
+git config user.name Test
+for i in 1 2 3 4 5; do
+    head -c 200000 /dev/urandom > "blob$i.bin"
+done
+git add -A
+git commit -qm "blobs"
+for i in 1 2 3 4 5; do
+    oid=$(git rev-parse "HEAD:blob$i.bin")
+    echo "$oid" | git pack-objects -q .git/objects/pack/pack > /dev/null
+done
+PACK_N=$(ls .git/objects/pack/*.pack | wc -l | tr -d ' ')
+[ "$PACK_N" -ge 4 ] || fail "multipack fixture has $PACK_N packs"
+# Diagnostic: the pack directory listing, for forensics when platform git
+# versions lay out packs differently than this script expects.
+ls -la .git/objects/pack/ || true
+"$GW" packs --json > "$FIXTURES/multipack.json"
+python3 - "$FIXTURES/multipack.json" "$PACK_N" <<'PYEOF'
+import json, sys
+
+d = json.load(open(sys.argv[1]))
+s = d["summary"]
+if s["pack_count"] != int(sys.argv[2]):
+    print(f"FAIL: pack_count {s['pack_count']} != {sys.argv[2]}", file=sys.stderr)
+    sys.exit(1)
+if not s["repack_hint"] or "repack" not in s["repack_hint"]:
+    print(f"FAIL: expected repack hint for fragmented packs: {s}", file=sys.stderr)
+    sys.exit(1)
+if s["smallest_pack"]["bytes"] > s["largest_pack"]["bytes"]:
+    print(f"FAIL: smallest > largest: {s}", file=sys.stderr)
+    sys.exit(1)
+print(f"ok: fragmentation summary ({s['pack_count']} packs, repack hint)")
+PYEOF
+PACKS_HUMAN=$("$GW" packs) || fail "packs command exited non-zero"
+if ! printf '%s\n' "$PACKS_HUMAN" | grep -q "hint: "; then
+    printf '%s\n' "$PACKS_HUMAN"
+    ls -la .git/objects/pack/ || true
+    fail "packs human output missing repack hint"
+fi
+echo "ok: packs human repack hint"
 
 echo "ALL INTEGRATION CHECKS PASSED"

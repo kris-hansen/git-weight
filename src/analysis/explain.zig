@@ -216,7 +216,10 @@ pub const Resolved = union(enum) {
     ambiguous_prefix: usize,
 };
 
-/// True when `s` is 4-64 hex characters (either case).
+/// True when `s` is 4-64 hex characters (either case). Callers that know
+/// the repository's hash algorithm should additionally cap `s` at its hex
+/// width (resolveTarget does) so a sha1 repo never prefix-matches a 64-char
+/// string against its 40-char ids.
 pub fn looksLikeHexPrefix(s: []const u8) bool {
     if (s.len < 4 or s.len > 64) return false;
     for (s) |c| {
@@ -233,7 +236,7 @@ pub fn resolveTarget(
     path_map: *const paths_mod.PathMap,
     target: []const u8,
 ) ExplainError!Resolved {
-    if (looksLikeHexPrefix(target)) {
+    if (target.len <= store.algorithm.hexLen() and looksLikeHexPrefix(target)) {
         var lower_buf: [64]u8 = undefined;
         const prefix = std.ascii.lowerString(&lower_buf, target);
         var match: ?object_id.ObjectId = null;
@@ -257,7 +260,7 @@ pub fn resolveTarget(
     var best_size: u64 = 0;
     var it = path_map.paths.iterator();
     while (it.next()) |e| {
-        if (!std.mem.eql(u8, e.value_ptr.*, target)) continue;
+        if (!std.mem.eql(u8, e.value_ptr.rep, target)) continue;
         const inf = store.info(e.key_ptr) catch continue;
         if (best == null or inf.size > best_size) {
             best = e.key_ptr.*;
@@ -346,9 +349,12 @@ const Collected = struct {
 };
 
 /// Walk every commit reachable from any ref (including HEAD), recording
-/// committer time, author, parents, and root tree. Reads commit payloads
-/// only (no trees); the expensive per-tree presence check runs separately,
-/// sharded across workers. Slice fields are owned by `arena`.
+/// committer time, author, parents, and root tree. Commits covered by the
+/// commit-graph are resolved from it without inflating payloads (authors
+/// are not stored there and stay null; analyzeHistory fetches the at most
+/// two it needs); everything else reads commit payloads (no trees). The
+/// expensive per-tree presence check runs separately, sharded across
+/// workers. Slice fields are owned by `arena`.
 fn collectCommits(
     store: *const object_store.ObjectStore,
     refs: *const refs_mod.Refs,
@@ -363,6 +369,8 @@ fn collectCommits(
     defer visited.deinit(arena);
     var stack: std.ArrayList(object_id.ObjectId) = .empty;
     defer stack.deinit(arena);
+    var graph_parent_buf: std.ArrayList(u32) = .empty;
+    defer graph_parent_buf.deinit(arena);
 
     for (refs.refs.items) |r| {
         const tip = paths_mod.peelToCommit(store, &r.target, 0) orelse continue;
@@ -380,6 +388,38 @@ fn collectCommits(
     defer seen_trees.deinit(arena);
 
     while (stack.pop()) |id| {
+        // Commit-graph fast path: identical parent order to the payload
+        // parse, so the DFS pop order is unchanged.
+        if (store.graph) |*g| {
+            if (g.lookup(&id)) |pos| {
+                const resolved = g.entry(pos, arena, &graph_parent_buf) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.InvalidGraph => null,
+                };
+                if (resolved) |ent| {
+                    if (!seen_trees.contains(ent.tree)) {
+                        try seen_trees.put(arena, ent.tree, {});
+                        try trees.append(arena, ent.tree);
+                    }
+                    const parents = try arena.alloc(object_id.ObjectId, ent.parents.len);
+                    for (ent.parents, 0..) |pp, i| parents[i] = g.oidAt(pp);
+                    try commits.append(arena, .{
+                        .id = id,
+                        .time = ent.time,
+                        .author = null, // not in the graph; see analyzeHistory
+                        .parents = parents,
+                        .tree = ent.tree,
+                        .present = false,
+                    });
+                    for (parents) |p| {
+                        if (visited.contains(p)) continue;
+                        try visited.put(arena, p, {});
+                        try stack.append(arena, p);
+                    }
+                    continue;
+                }
+            }
+        }
         _ = scratch.reset(.retain_capacity);
         const payload = store.readPayload(scratch.allocator(), &id) catch continue;
         defer payload.release();
@@ -530,7 +570,33 @@ fn analyzeHistory(
         }
     }
 
-    return pickHistory(collected.commits.items, &present_by_id, head_present);
+    var history = pickHistory(collected.commits.items, &present_by_id, head_present);
+    // Commits served from the commit-graph have no author (CDAT does not
+    // store one). The report needs at most two: inflate exactly those
+    // payloads rather than every payload in history.
+    if (history.introduced) |*c| {
+        if (c.author == null) c.author = try commitAuthorIdent(store, arena, &c.id);
+    }
+    if (history.deleted) |*c| {
+        if (c.author == null) c.author = try commitAuthorIdent(store, arena, &c.id);
+    }
+    return history;
+}
+
+/// Author ident "Name <email>" of a commit, or null when the payload is
+/// unavailable or unparseable. `arena` owns the returned string.
+fn commitAuthorIdent(
+    store: *const object_store.ObjectStore,
+    arena: std.mem.Allocator,
+    id: *const object_id.ObjectId,
+) ExplainError!?[]const u8 {
+    var scratch = std.heap.ArenaAllocator.init(arena);
+    defer scratch.deinit();
+    const payload = store.readPayload(scratch.allocator(), id) catch return null;
+    defer payload.release();
+    if (payload.object_type != .commit) return null;
+    const c = commit_mod.parse(payload.data, id.algorithm, scratch.allocator()) catch return null;
+    return if (c.author) |a| try arena.dupe(u8, a.ident) else null;
 }
 
 /// Select introducing/deleting commits from walk-ordered commits: the

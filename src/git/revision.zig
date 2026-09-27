@@ -94,15 +94,16 @@ pub fn resolve(
     return commit;
 }
 
-/// Resolve the base name: full hex oid that exists in the store, or a ref
-/// name tried as-is and under refs/heads/, refs/tags/, refs/remotes/
-/// (a bare "HEAD" matches via the as-is case).
+/// Resolve the base name: a full hex oid of the repository's hash width
+/// that exists in the store, or a ref name tried as-is and under
+/// refs/heads/, refs/tags/, refs/remotes/ (a bare "HEAD" matches via the
+/// as-is case).
 fn resolveBase(
     store: *const object_store.ObjectStore,
     refs: *const refs_mod.Refs,
     base: []const u8,
 ) ResolveError!object_id.ObjectId {
-    if (object_id.ObjectId.fromHex(base) catch null) |id| {
+    if (object_id.ObjectId.parseHex(base, store.algorithm) catch null) |id| {
         switch (store.locate(&id)) {
             .missing => {},
             else => return id,

@@ -340,16 +340,32 @@ Example:
 PACK                          OBJECTS     PHYSICAL SIZE
 pack-a2f...pack               812,221     1.91 GB
 pack-c91...pack               430,114     701 MB
+
+Delta compression
+  pack-a2f...pack             402,113 deltas   max depth 14   mean 3.20   612 MB stored for 1.42 GB logical (43%)
+
+Pack fragmentation
+  Packs               2
+  Smallest            701 MB (pack-c91...pack)
+  Largest             1.91 GB (pack-a2f...pack)
 ```
 
-Future versions may additionally report:
+Implemented (previously listed as future work):
 
-- delta depth
-- compression efficiency
-- large delta bases
-- duplicate content
-- pack fragmentation
-- repack opportunities
+- delta depth — per-pack delta object count, max and mean chain depth
+- compression efficiency — physical entry bytes stored for delta objects versus their logical size
+- pack fragmentation — pack count, smallest/largest pack
+- repack opportunities — a one-line hint when many small packs or poor
+  delta compression are detected (e.g. `git repack -ad`)
+
+`--json` adds these to each pack entry (`delta_count`, `max_delta_depth`,
+`mean_delta_depth`, `delta_logical_bytes`, `delta_physical_bytes`) plus a
+top-level `summary` object (`pack_count`, `total_bytes`, `smallest_pack`,
+`largest_pack`, `total_delta_count`, `delta_ratio`, `repack_hint`), all
+additive over the original `name`/`objects`/`pack_bytes` fields.
+
+Still future: large delta bases, duplicate content within a pack (see
+`git-weight dupes`, §6.9, for cross-pack duplicate paths).
 
 ---
 
@@ -395,6 +411,7 @@ At least one threshold is required; each `--max-*` option takes a size (e.g. `10
 - `--max-historical SIZE` — bytes of historical (deleted-at-HEAD) content
 - `--max-unreachable SIZE` — physical bytes reclaimable via `git gc`
 - `--max-blob SIZE` — largest single blob by logical size
+- `--max-growth SIZE` — logical bytes introduced in the most recent calendar month (the same attribution as `git-weight growth`, §6.10)
 
 Example:
 
@@ -408,9 +425,88 @@ Thresholds
 Verdict: FAIL
 ```
 
-The analysis reuses the summary pass, so `check` costs about the same as one `summary` run. Exit code 6 means a threshold was exceeded; 0 means all configured thresholds passed. With `--json`, output is `{"repository": {...}, "thresholds": [{"name", "limit", "actual", "ok"}], "ok": ...}`.
+The analysis reuses the summary pass, so `check` costs about the same as one `summary` run (`--max-growth` additionally runs the growth analysis of §6.10). Exit code 6 means a threshold was exceeded; 0 means all configured thresholds passed. With `--json`, output is `{"repository": {...}, "thresholds": [{"name", "limit", "actual", "ok"}], "ok": ...}`.
 
-Growth-based checks (`--max-growth`) remain future work (see §36).
+---
+
+## 6.9 `git-weight dupes`
+
+Identical content committed under multiple paths (spec §36, implemented).
+
+```bash
+git-weight dupes
+```
+
+Blobs whose identical content (the same object id) lives at 2+ distinct
+paths — at HEAD, anywhere in reachable history, or both. Every copy past
+the first is redundant: groups are sorted by reclaimable bytes
+(`size × (path count − 1)`) and list the object id, size, and each path.
+
+```text
+WASTED     SIZE       PATHS  OID
+1.31 GB    655 MB     3      a921ab7
+  models/model.bin
+  archive/model-2021.bin
+  vendor/model.bin
+
+Total reclaimable if deduplicated: 1.31 GB across 1 group
+```
+
+Options:
+
+```bash
+git-weight dupes --limit 50
+git-weight dupes --min-size 10MB
+git-weight dupes --current      # only duplicate paths within the HEAD tree
+git-weight dupes --historical   # only blobs no longer present at HEAD
+```
+
+Stored paths are capped at 32 per blob; past the cap the group is marked
+truncated and the path count becomes a lower bound. `--json` output is
+`{"dupes": [{"oid", "size", "paths", "path_count", "truncated",
+"wasted_bytes"}], "total_wasted_bytes"}`.
+
+Note this detects same-oid duplicates (hard copies, vendored files). Binary-
+identical content committed with different object identities (different
+headers, filters, or chunking) is not detected.
+
+---
+
+## 6.10 `git-weight growth`
+
+Repository growth over time (spec §36, implemented).
+
+```bash
+git-weight growth
+```
+
+Every reachable commit is bucketed by committer calendar month. Each
+blob's logical size is attributed to the month of its introducing commit —
+the earliest commit (by committer time) that contains the blob while its
+parents do not — so the report measures how fast history accumulates
+weight. Content that was later deleted still counts toward the month that
+introduced it.
+
+```text
+MONTH      INTRODUCED   CUMULATIVE
+2020-01    3.00 MB      3.00 MB
+2020-03    2.00 MB      5.00 MB
+2021-02    7.63 MB      12.6 MB
+```
+
+`INTRODUCED` is the total logical bytes introduced by commits in that
+month; `CUMULATIVE` is the running total through that month.
+
+```bash
+git-weight growth --months 6   # only the most recent 6 month buckets
+```
+
+`--json` output is `{"buckets": [{"month", "introduced_bytes",
+"cumulative_bytes"}], "total_introduced_bytes"}`, where
+`total_introduced_bytes` covers all history even when `--months` slices
+the buckets. Merge commits are diffed against their first parent; content
+merged in from a side branch is attributed to the side branch's own
+commits.
 
 ---
 
@@ -471,6 +567,7 @@ Storage that could plausibly be removed either by garbage collection or history 
 --threads N
 --limit N
 --min-size SIZE
+--months N
 --version
 --help
 ```
@@ -1098,6 +1195,8 @@ git-weight objects [PATH]
 git-weight packs [PATH]
 git-weight refs [PATH]
 git-weight unreachable [PATH]
+git-weight dupes [PATH]
+git-weight growth [PATH]
 ```
 
 Common options:
@@ -1106,6 +1205,7 @@ Common options:
 --json
 --limit N
 --min-size SIZE
+--months N
 --threads N
 --no-color
 --verbose
@@ -1248,6 +1348,9 @@ The binary should have no runtime dependency beyond normal OS facilities.
 
 ## Repository growth
 
+Implemented as `git-weight growth` (see §6.10): logical bytes introduced
+per committer calendar month, cumulative history weight, and `--months N`.
+
 ```bash
 git-weight growth
 ```
@@ -1278,13 +1381,15 @@ Identify commits responsible for the largest increases in repository weight.
 
 Implemented as `git-weight check` (see §6.8): threshold checks on current repository data (`--max-size`, `--max-historical`, `--max-unreachable`, `--max-blob`), exiting 6 when a threshold is exceeded.
 
-Growth-based checks remain future work:
+Growth-based checks are implemented too:
 
 ```bash
 git-weight check --max-growth 10MB
 ```
 
-Fail CI if a pull request introduces excessive repository growth.
+Fail CI if a pull request introduces excessive repository growth: the most
+recent calendar month's introduced bytes (§6.10 attribution) must not
+exceed the limit.
 
 ---
 
@@ -1331,7 +1436,13 @@ archives/*.zip    229 MB
 
 ## Duplicate content
 
-Identify large blobs referenced under multiple paths or historically duplicated with different object identities where detectable.
+Implemented as `git-weight dupes` (see §6.9) for identical content: blobs
+with the same object id referenced under multiple paths, historically
+duplicated or multiply present at HEAD, with per-group reclaimable bytes.
+
+Detecting binary-identical content that was committed with different
+object identities (different headers, filters, or chunking) remains future
+work.
 
 ---
 

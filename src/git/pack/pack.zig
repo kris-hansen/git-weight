@@ -30,6 +30,8 @@ pub const ObjectInfo = struct {
     /// Offset where the zlib stream (or delta stream) begins.
     data_offset: u64,
     delta_base: DeltaBase,
+    /// Delta chain depth: 0 for base objects, 1 + base depth for deltas.
+    delta_depth: u32 = 0,
 };
 
 const max_delta_depth = 4096;
@@ -156,6 +158,7 @@ pub const Pack = struct {
                 .offset = offset,
                 .data_offset = raw.data_offset,
                 .delta_base = .none,
+                .delta_depth = 0,
             },
             .ofs_delta, .ref_delta => {
                 const base_offset = try self.baseOffset(raw.base);
@@ -167,6 +170,7 @@ pub const Pack = struct {
                     .offset = offset,
                     .data_offset = raw.data_offset,
                     .delta_base = raw.base,
+                    .delta_depth = base_info.delta_depth + 1,
                 };
             },
         }
@@ -200,6 +204,7 @@ pub const Pack = struct {
                         .offset = cur,
                         .data_offset = raw.data_offset,
                         .delta_base = .none,
+                        .delta_depth = 0,
                     };
                     break :walk;
                 },
@@ -215,7 +220,8 @@ pub const Pack = struct {
         try cache.put(allocator, cur, base_info);
 
         // Unwind deepest-first: each delta's logical size comes from its own
-        // stream header; the type propagates up from the base.
+        // stream header; the type propagates up from the base. Chain depth is
+        // the base's depth plus the number of delta hops above it.
         var resolved = base_info;
         var i = chain.items.len;
         while (i > 0) {
@@ -229,6 +235,7 @@ pub const Pack = struct {
                 .offset = entry_off,
                 .data_offset = raw.data_offset,
                 .delta_base = raw.base,
+                .delta_depth = base_info.delta_depth + @as(u32, @intCast(chain.items.len - i)),
             };
             try cache.put(allocator, entry_off, resolved);
         }

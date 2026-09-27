@@ -10,6 +10,11 @@ pub const HashAlgorithm = enum {
             .sha256 => 32,
         };
     }
+
+    /// Length of the lowercase hex representation.
+    pub fn hexLen(self: HashAlgorithm) usize {
+        return self.rawLen() * 2;
+    }
 };
 
 pub const max_raw_len = 32;
@@ -73,6 +78,20 @@ pub const ObjectId = struct {
         return id;
     }
 
+    /// Parse a full hex object id whose width is dictated by `algorithm`
+    /// (payload context), not inferred from the string length as in
+    /// `fromHex`. Rejects ids of any other width.
+    pub fn parseHex(hex_str: []const u8, algorithm: HashAlgorithm) !ObjectId {
+        if (hex_str.len != algorithm.hexLen()) return error.InvalidObjectId;
+        var id: ObjectId = .{ .algorithm = algorithm };
+        for (0..algorithm.rawLen()) |i| {
+            const hi = std.fmt.charToDigit(hex_str[i * 2], 16) catch return error.InvalidObjectId;
+            const lo = std.fmt.charToDigit(hex_str[i * 2 + 1], 16) catch return error.InvalidObjectId;
+            id.bytes[i] = (@as(u8, hi) << 4) | lo;
+        }
+        return id;
+    }
+
     /// Context for std.HashMap / HashMapUnmanaged keyed by ObjectId.
     pub const Context = struct {
         pub fn hash(_: Context, key: ObjectId) u64 {
@@ -107,4 +126,28 @@ test "sha256 object id" {
     try std.testing.expectEqual(@as(usize, 32), id.rawLen());
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("a" ** 64, id.hex(&buf));
+}
+
+test "parseHex round trip enforces algorithm width" {
+    const sha1_hex = "81f43dc8215a9b66a3bb71b11ffde1a3542e1e0d";
+    const sha256_hex = "a29495cd7ca6ee34e358698f44f6e334b497c284a192e8e8fba4c09700b6f254";
+
+    var buf: [64]u8 = undefined;
+
+    const a = try ObjectId.parseHex(sha1_hex, .sha1);
+    try std.testing.expectEqual(HashAlgorithm.sha1, a.algorithm);
+    try std.testing.expectEqualStrings(sha1_hex, a.hex(&buf));
+    const a_rt = try ObjectId.parseHex(a.hex(&buf), .sha1);
+    try std.testing.expect(a.eql(&a_rt));
+
+    const b = try ObjectId.parseHex(sha256_hex, .sha256);
+    try std.testing.expectEqual(HashAlgorithm.sha256, b.algorithm);
+    try std.testing.expectEqualStrings(sha256_hex, b.hex(&buf));
+    const b_rt = try ObjectId.parseHex(b.hex(&buf), .sha256);
+    try std.testing.expect(b.eql(&b_rt));
+
+    // Cross-width and malformed input are rejected.
+    try std.testing.expectError(error.InvalidObjectId, ObjectId.parseHex(sha256_hex, .sha1));
+    try std.testing.expectError(error.InvalidObjectId, ObjectId.parseHex(sha1_hex, .sha256));
+    try std.testing.expectError(error.InvalidObjectId, ObjectId.parseHex(sha1_hex[0..39], .sha1));
 }

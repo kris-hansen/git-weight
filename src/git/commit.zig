@@ -43,7 +43,6 @@ pub fn parse(
     algorithm: object_id.HashAlgorithm,
     alloc: std.mem.Allocator,
 ) (CommitError || std.mem.Allocator.Error)!Commit {
-    _ = algorithm; // oid width currently fixed at SHA-1; kept for SHA-256
     var tree: ?object_id.ObjectId = null;
     var author: ?Signature = null;
     var committer: ?Signature = null;
@@ -66,9 +65,9 @@ pub fn parse(
             };
         }
         if (std.mem.startsWith(u8, line, "tree ")) {
-            tree = object_id.ObjectId.fromHex(line[5..]) catch return error.InvalidCommit;
+            tree = object_id.ObjectId.parseHex(line[5..], algorithm) catch return error.InvalidCommit;
         } else if (std.mem.startsWith(u8, line, "parent ")) {
-            const p = object_id.ObjectId.fromHex(line[7..]) catch return error.InvalidCommit;
+            const p = object_id.ObjectId.parseHex(line[7..], algorithm) catch return error.InvalidCommit;
             try parents.append(alloc, p);
         } else if (std.mem.startsWith(u8, line, "author ")) {
             author = parseSignature(line[7..]);
@@ -99,4 +98,28 @@ test "parse commit" {
     try std.testing.expectEqual(@as(i64, 1552272000), c.author.?.timestamp);
     var hexbuf: [40]u8 = undefined;
     try std.testing.expectEqualStrings("81f43dc8215a9b66a3bb71b11ffde1a3542e1e0d", c.tree.hex(&hexbuf));
+}
+
+test "parse sha256 commit" {
+    const tree_hex = "a29495cd7ca6ee34e358698f44f6e334b497c284a192e8e8fba4c09700b6f254";
+    const parent_hex = "19e3844a76c1e617ee4d23cbfbee2fc69f0a0373920e0b7db32b9ea47ce8f9a9";
+    const payload = "tree " ++ tree_hex ++ "\n" ++
+        "parent " ++ parent_hex ++ "\n" ++
+        "author Alice Example <alice@example.com> 1552272000 +0000\n" ++
+        "committer Bob <bob@example.com> 1552272001 +0000\n" ++
+        "\n" ++
+        "hello sha256\n";
+    const c = try parse(payload, .sha256, std.testing.allocator);
+    defer std.testing.allocator.free(c.parents);
+    try std.testing.expectEqual(object_id.HashAlgorithm.sha256, c.tree.algorithm);
+    try std.testing.expectEqual(object_id.HashAlgorithm.sha256, c.parents[0].algorithm);
+    try std.testing.expectEqual(@as(usize, 1), c.parents.len);
+    try std.testing.expectEqualStrings("hello sha256\n", c.message());
+    var hexbuf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(tree_hex, c.tree.hex(&hexbuf));
+    try std.testing.expectEqualStrings(parent_hex, c.parents[0].hex(&hexbuf));
+
+    // The SHA-1 width must reject the same payload.
+    const wrong = parse(payload, .sha1, std.testing.allocator);
+    try std.testing.expectError(error.InvalidCommit, wrong);
 }

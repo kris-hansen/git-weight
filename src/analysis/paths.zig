@@ -25,8 +25,9 @@ pub const PathMap = struct {
     /// Representative path per blob (may not contain every blob). Blobs in
     /// HEAD's tree always get their HEAD path; other blobs get the
     /// lexicographically smallest path seen (deterministic under
-    /// parallelism).
-    paths: std.HashMapUnmanaged(object_id.ObjectId, []const u8, object_id.ObjectId.Context, 80),
+    /// parallelism). Values keep the extra distinct paths seen for blobs
+    /// living at 2+ paths (see BlobPaths).
+    paths: std.HashMapUnmanaged(object_id.ObjectId, BlobPaths, object_id.ObjectId.Context, 80),
     /// Blob oids present in HEAD's tree ("current").
     current: std.HashMapUnmanaged(object_id.ObjectId, void, object_id.ObjectId.Context, 80),
     /// Every object visited during the walk: all commits, trees, and blobs
@@ -46,9 +47,112 @@ pub const PathMap = struct {
     }
 
     pub fn pathOf(self: *const PathMap, id: *const object_id.ObjectId) ?[]const u8 {
-        return self.paths.get(id.*);
+        const v = self.paths.get(id.*) orelse return null;
+        return v.rep;
     }
 };
+
+/// Maximum distinct paths retained per blob; beyond this the path list is
+/// marked truncated (the path count becomes a lower bound).
+pub const max_paths_per_blob = 32;
+
+/// Distinct non-representative paths observed for a blob.
+pub const ExtraPaths = struct {
+    /// Arena-owned path strings (never freed individually).
+    items: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// More than `max_paths_per_blob` distinct paths were seen.
+    truncated: bool = false,
+};
+
+/// Per-blob path record: the representative path plus (lazily) the other
+/// distinct paths the blob was seen at.
+pub const BlobPaths = struct {
+    /// Representative path: HEAD path when present, else smallest path.
+    rep: []const u8,
+    /// Additional distinct paths beyond `rep`; null until a second distinct
+    /// path is seen.
+    extra: ?*ExtraPaths = null,
+};
+
+/// Distinct paths observed for a blob (capped at `max_paths_per_blob`).
+pub fn pathCount(v: *const BlobPaths) struct { count: u64, truncated: bool } {
+    const ex = v.extra orelse return .{ .count = 1, .truncated = false };
+    return .{ .count = 1 + ex.items.items.len, .truncated = ex.truncated };
+}
+
+/// Record `path` for `id`, keeping the lexicographically smallest path as
+/// the representative (used by per-worker maps so merged representatives
+/// stay deterministic under parallelism).
+fn recordPathSmallest(
+    map: *std.HashMapUnmanaged(object_id.ObjectId, BlobPaths, object_id.ObjectId.Context, 80),
+    allocator: std.mem.Allocator,
+    id: *const object_id.ObjectId,
+    path: []const u8,
+) PathError!void {
+    const gop = try map.getOrPut(allocator, id.*);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = .{ .rep = try allocator.dupe(u8, path) };
+        return;
+    }
+    const v = gop.value_ptr;
+    if (std.mem.order(u8, path, v.rep) == .lt) {
+        const old = v.rep;
+        v.rep = try allocator.dupe(u8, path);
+        try appendPath(v, allocator, old);
+    } else {
+        try appendPath(v, allocator, path);
+    }
+}
+
+/// Record `path` for `id` in `map` (get-or-create semantics; first path
+/// becomes the representative). Used by dupes' HEAD-only walk as well as
+/// the main path walk.
+pub fn recordBlobPath(
+    map: *std.HashMapUnmanaged(object_id.ObjectId, BlobPaths, object_id.ObjectId.Context, 80),
+    allocator: std.mem.Allocator,
+    id: *const object_id.ObjectId,
+    path: []const u8,
+) PathError!void {
+    const gop = try map.getOrPut(allocator, id.*);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = .{ .rep = try allocator.dupe(u8, path) };
+        return;
+    }
+    try appendPath(gop.value_ptr, allocator, path);
+}
+
+/// Union another record's paths (its representative plus extras) into `v`.
+fn mergeExtras(
+    v: *BlobPaths,
+    allocator: std.mem.Allocator,
+    src: BlobPaths,
+) PathError!void {
+    try appendPath(v, allocator, src.rep);
+    if (src.extra) |ex| {
+        for (ex.items.items) |p| try appendPath(v, allocator, p);
+        if (ex.truncated) v.extra.?.truncated = true;
+    }
+}
+
+/// Add a non-representative path, keeping the list deduplicated and capped;
+/// sets the truncated marker past the cap.
+fn appendPath(v: *BlobPaths, allocator: std.mem.Allocator, path: []const u8) PathError!void {
+    if (std.mem.eql(u8, v.rep, path)) return;
+    if (v.extra == null) {
+        const ex = try allocator.create(ExtraPaths);
+        ex.* = .{};
+        v.extra = ex;
+    }
+    const ex = v.extra.?;
+    for (ex.items.items) |p| {
+        if (std.mem.eql(u8, p, path)) return;
+    }
+    if (ex.items.items.len < max_paths_per_blob - 1) {
+        try ex.items.append(allocator, try allocator.dupe(u8, path));
+    } else {
+        ex.truncated = true;
+    }
+}
 
 /// Peel a ref target (possibly an annotated tag) down to a commit oid.
 pub fn peelToCommit(store: *const object_store.ObjectStore, id: *const object_id.ObjectId, depth: usize) ?object_id.ObjectId {
@@ -135,7 +239,7 @@ const Worker = struct {
     scratch: std.heap.ArenaAllocator,
     /// Owns local_paths entries and strings.
     arena: std.heap.ArenaAllocator,
-    local_paths: std.HashMapUnmanaged(object_id.ObjectId, []const u8, object_id.ObjectId.Context, 80) = .empty,
+    local_paths: std.HashMapUnmanaged(object_id.ObjectId, BlobPaths, object_id.ObjectId.Context, 80) = .empty,
     prefix: std.ArrayList(u8) = .empty,
 
     fn deinit(self: *Worker) void {
@@ -184,13 +288,17 @@ pub fn compute(
     defer tag_extra.deinit(allocator);
 
     // Sequential commit-graph walk: collect every reachable commit and its
-    // root tree. Reads no trees; cheap relative to the tree walk.
+    // root tree. Commits covered by the commit-graph file are resolved from
+    // it (no payload inflation); anything absent falls back to object
+    // parsing below. Reads no trees; cheap relative to the tree walk.
     var visited: std.HashMapUnmanaged(object_id.ObjectId, void, object_id.ObjectId.Context, 80) = .empty;
     defer visited.deinit(allocator);
     var stack: std.ArrayList(object_id.ObjectId) = .empty;
     defer stack.deinit(allocator);
     var commits: std.ArrayList(CommitTree) = .empty;
     defer commits.deinit(allocator);
+    var graph_parent_buf: std.ArrayList(u32) = .empty;
+    defer graph_parent_buf.deinit(allocator);
 
     for (refs.refs.items) |r| {
         {
@@ -220,6 +328,27 @@ pub fn compute(
     }
 
     while (stack.pop()) |id| {
+        // Commit-graph fast path: same parent list, same push order, so the
+        // DFS pop order (and thus everything downstream) is identical to
+        // the payload-parse path.
+        if (store.graph) |*g| {
+            if (g.lookup(&id)) |pos| {
+                const resolved = g.entry(pos, allocator, &graph_parent_buf) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.InvalidGraph => null,
+                };
+                if (resolved) |ent| {
+                    try commits.append(allocator, .{ .id = id, .tree = ent.tree });
+                    for (ent.parents) |pp| {
+                        const p = g.oidAt(pp);
+                        if (visited.contains(p)) continue;
+                        try visited.put(allocator, p, {});
+                        try stack.append(allocator, p);
+                    }
+                    continue;
+                }
+            }
+        }
         _ = bfs_scratch.reset(.retain_capacity);
         const payload = store.readPayload(bfs_scratch.allocator(), &id) catch continue;
         if (payload.object_type != .commit) continue;
@@ -259,7 +388,9 @@ pub fn compute(
 
     // Full history walk, parallel across workers. Worker structs must stay
     // put once threads see them.
-    const n_workers = @max(1, @min(store.threads, max_workers));
+    // Explicit usize: @min against a comptime bound would otherwise infer
+    // a narrow type for the worker count.
+    const n_workers: usize = @max(1, @min(store.threads, max_workers));
     if (n_workers > 1) {
         // Pre-resolve loose headers so workers only read shared loose state
         // (lazy resolution writes back into the list).
@@ -291,17 +422,30 @@ pub fn compute(
     }
     if (shared.failed.load(.acquire)) return error.OutOfMemory;
 
-    // Merge worker-local path maps: smallest path wins (the base map already
-    // holds HEAD paths, which always win since workers skip them).
+    // Merge worker-local path records. HEAD blobs (already in `paths` with
+    // their HEAD path, and present in `current`) only gain extra paths —
+    // their representative paths are final. Other blobs pick the
+    // lexicographically smallest representative across workers, with all
+    // observed extra paths unioned.
     for (workers_buf[0..n_init]) |*w| {
         var it = w.local_paths.iterator();
         while (it.next()) |e| {
+            if (!map.current.contains(e.key_ptr.*)) continue;
+            const gop = try map.paths.getOrPut(arena, e.key_ptr.*);
+            if (gop.found_existing) try mergeExtras(gop.value_ptr, arena, e.value_ptr.*);
+        }
+    }
+    for (workers_buf[0..n_init]) |*w| {
+        var it = w.local_paths.iterator();
+        while (it.next()) |e| {
+            if (map.current.contains(e.key_ptr.*)) continue;
             const gop = try map.paths.getOrPut(arena, e.key_ptr.*);
             if (!gop.found_existing) {
-                gop.value_ptr.* = try arena.dupe(u8, e.value_ptr.*);
-            } else if (std.mem.order(u8, e.value_ptr.*, gop.value_ptr.*) == .lt) {
-                gop.value_ptr.* = try arena.dupe(u8, e.value_ptr.*);
+                gop.value_ptr.* = .{ .rep = try arena.dupe(u8, e.value_ptr.rep) };
+            } else if (std.mem.order(u8, e.value_ptr.rep, gop.value_ptr.rep) == .lt) {
+                gop.value_ptr.rep = try arena.dupe(u8, e.value_ptr.rep);
             }
+            try mergeExtras(gop.value_ptr, arena, e.value_ptr.*);
         }
     }
 
@@ -409,23 +553,99 @@ fn walkTree(
                 .shared => |map| {
                     const arena = map.arena.allocator();
                     try map.current.put(arena, entry.id, {});
-                    const gop = try map.paths.getOrPut(arena, entry.id);
-                    if (!gop.found_existing) {
-                        gop.value_ptr.* = try arena.dupe(u8, prefix.items);
-                    }
+                    try recordBlobPath(&map.paths, arena, &entry.id, prefix.items);
                 },
                 .local => |w| {
-                    if (w.base.pathOf(&entry.id) != null) continue;
-                    const a = w.arena.allocator();
-                    const gop = try w.local_paths.getOrPut(a, entry.id);
-                    if (!gop.found_existing) {
-                        gop.value_ptr.* = try a.dupe(u8, prefix.items);
-                    } else if (std.mem.order(u8, prefix.items, gop.value_ptr.*) == .lt) {
-                        gop.value_ptr.* = try a.dupe(u8, prefix.items);
-                    }
+                    try recordPathSmallest(&w.local_paths, w.arena.allocator(), &entry.id, prefix.items);
                 },
             },
             .submodule => {},
         }
     }
+}
+
+test "recordPath dedupes, caps, and marks truncation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var map: std.HashMapUnmanaged(object_id.ObjectId, BlobPaths, object_id.ObjectId.Context, 80) = .empty;
+    defer map.deinit(alloc);
+    const id = object_id.ObjectId.zero_sha1;
+
+    try recordBlobPath(&map, alloc, &id, "b.txt");
+    var pc = pathCount(&map.get(id).?);
+    try std.testing.expectEqual(@as(u64, 1), pc.count);
+    try std.testing.expect(!pc.truncated);
+
+    // Duplicate path: no-op.
+    try recordBlobPath(&map, alloc, &id, "b.txt");
+    pc = pathCount(&map.get(id).?);
+    try std.testing.expectEqual(@as(u64, 1), pc.count);
+
+    try recordBlobPath(&map, alloc, &id, "a.txt");
+    pc = pathCount(&map.get(id).?);
+    try std.testing.expectEqual(@as(u64, 2), pc.count);
+    try std.testing.expectEqualStrings("b.txt", map.get(id).?.rep); // first wins
+
+    // Fill to the cap, then overflow sets truncated.
+    var i: usize = 0;
+    while (i < max_paths_per_blob + 4) : (i += 1) {
+        var buf: [32]u8 = undefined;
+        const p = std.fmt.bufPrint(&buf, "p{d:0>3}.bin", .{i}) catch unreachable;
+        try recordBlobPath(&map, alloc, &id, p);
+    }
+    pc = pathCount(&map.get(id).?);
+    try std.testing.expectEqual(@as(u64, max_paths_per_blob), pc.count);
+    try std.testing.expect(pc.truncated);
+}
+
+test "recordPathSmallest keeps smallest representative" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var map: std.HashMapUnmanaged(object_id.ObjectId, BlobPaths, object_id.ObjectId.Context, 80) = .empty;
+    defer map.deinit(alloc);
+    const id = object_id.ObjectId.zero_sha1;
+
+    try recordPathSmallest(&map, alloc, &id, "z/late.bin");
+    try recordPathSmallest(&map, alloc, &id, "a/early.bin");
+    try recordPathSmallest(&map, alloc, &id, "m/mid.bin");
+    const v = map.get(id).?;
+    try std.testing.expectEqualStrings("a/early.bin", v.rep);
+    const pc = pathCount(&v);
+    try std.testing.expectEqual(@as(u64, 3), pc.count);
+}
+
+test "mergeExtras unions and propagates truncation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var dst_map: std.HashMapUnmanaged(object_id.ObjectId, BlobPaths, object_id.ObjectId.Context, 80) = .empty;
+    defer dst_map.deinit(alloc);
+    var src_map: std.HashMapUnmanaged(object_id.ObjectId, BlobPaths, object_id.ObjectId.Context, 80) = .empty;
+    defer src_map.deinit(alloc);
+    const id = object_id.ObjectId.zero_sha1;
+
+    try recordBlobPath(&dst_map, alloc, &id, "shared.bin");
+    try recordBlobPath(&src_map, alloc, &id, "other.bin");
+    try mergeExtras(dst_map.getPtr(id).?, alloc, src_map.get(id).?);
+    var pc = pathCount(&dst_map.get(id).?);
+    try std.testing.expectEqual(@as(u64, 2), pc.count);
+    try std.testing.expect(!pc.truncated);
+
+    // Merge a truncated source: truncation propagates, count still capped.
+    const id2 = object_id.ObjectId{ .algorithm = .sha1, .bytes = [_]u8{1} ** 32 };
+    try recordBlobPath(&dst_map, alloc, &id2, "x.bin");
+    try recordBlobPath(&src_map, alloc, &id2, "y.bin");
+    var i: usize = 0;
+    while (i < max_paths_per_blob + 2) : (i += 1) {
+        var buf: [32]u8 = undefined;
+        const p = std.fmt.bufPrint(&buf, "q{d:0>3}.bin", .{i}) catch unreachable;
+        try recordBlobPath(&src_map, alloc, &id2, p);
+    }
+    try std.testing.expect(pathCount(&src_map.get(id2).?).truncated);
+    try mergeExtras(dst_map.getPtr(id2).?, alloc, src_map.get(id2).?);
+    pc = pathCount(&dst_map.get(id2).?);
+    try std.testing.expect(pc.truncated);
+    try std.testing.expectEqual(@as(u64, max_paths_per_blob), pc.count);
 }

@@ -8,6 +8,8 @@ const refs_analysis = @import("../analysis/refs.zig");
 const explain_mod = @import("../analysis/explain.zig");
 const changed_mod = @import("../analysis/changed.zig");
 const check_mod = @import("../analysis/check.zig");
+const dupes_mod = @import("../analysis/dupes.zig");
+const growth_mod = @import("../analysis/growth.zig");
 const object_id = @import("../git/object_id.zig");
 
 pub const WriteError = std.Io.Writer.Error;
@@ -163,7 +165,64 @@ pub fn printObjects(w: *std.Io.Writer, stats: *const objects_mod.ObjectStats) Wr
     }
 }
 
-pub fn printPacks(w: *std.Io.Writer, packs: []const packs_mod.PackInfo) WriteError!void {
+pub fn printGrowth(w: *std.Io.Writer, report: *const growth_mod.GrowthReport) WriteError!void {
+    if (report.buckets.len == 0) {
+        try w.writeAll("No commits in repository history\n");
+        return;
+    }
+    try w.writeAll("MONTH      INTRODUCED   CUMULATIVE\n");
+    var hbuf: [64]u8 = undefined;
+    var mbuf: [8]u8 = undefined;
+    for (report.buckets) |b| {
+        const month = growth_mod.formatMonth(&mbuf, b.year * 12 + b.month - 1);
+        try w.print("{s}", .{month});
+        var pad: usize = if (month.len < 11) 11 - month.len else 1;
+        while (pad > 0) : (pad -= 1) try w.writeByte(' ');
+        const intro = formatSize(&hbuf, b.introduced_bytes);
+        try w.print("{s}", .{intro});
+        pad = if (intro.len < 13) 13 - intro.len else 1;
+        while (pad > 0) : (pad -= 1) try w.writeByte(' ');
+        try w.print("{s}\n", .{formatSize(&hbuf, b.cumulative_bytes)});
+    }
+    var sbuf: [32]u8 = undefined;
+    try w.print("\nLogical bytes introduced per calendar month of each blob's introducing commit.\n", .{});
+    try w.print("Total introduced across history: {s}\n", .{formatSize(&sbuf, report.total_introduced_bytes)});
+}
+
+pub fn printDupes(w: *std.Io.Writer, report: *const dupes_mod.DupesReport) WriteError!void {
+    var hbuf: [64]u8 = undefined;
+    var obuf: [64]u8 = undefined;
+    if (report.groups.len == 0) {
+        try w.writeAll("No duplicate content found (identical blobs at 2+ paths)\n");
+        return;
+    }
+    try w.writeAll("WASTED     SIZE       PATHS  OID\n");
+    for (report.groups) |g| {
+        const wasted_str = formatSize(&hbuf, g.wasted_bytes);
+        try w.print("{s}", .{wasted_str});
+        var pad: usize = if (wasted_str.len < 11) 11 - wasted_str.len else 1;
+        while (pad > 0) : (pad -= 1) try w.writeByte(' ');
+        const size_str = formatSize(&hbuf, g.size);
+        try w.print("{s}", .{size_str});
+        pad = if (size_str.len < 11) 11 - size_str.len else 1;
+        while (pad > 0) : (pad -= 1) try w.writeByte(' ');
+        const count_str = std.fmt.bufPrint(&obuf, "{d}{s}", .{ g.path_count, if (g.truncated) "+" else "" }) catch unreachable;
+        try w.print("{s}", .{count_str});
+        pad = if (count_str.len < 7) 7 - count_str.len else 1;
+        while (pad > 0) : (pad -= 1) try w.writeByte(' ');
+        try w.print("{s}\n", .{g.id.abbrev(&obuf, 7)});
+        for (g.paths) |p| try w.print("  {s}\n", .{p});
+        if (g.truncated) try w.writeAll("  ... (more paths; count is a lower bound)\n");
+    }
+    var sbuf: [32]u8 = undefined;
+    try w.print("\nTotal reclaimable if deduplicated: {s} across {d} group{s}\n", .{
+        formatSize(&sbuf, report.total_wasted_bytes),
+        report.groups.len,
+        if (report.groups.len == 1) "" else "s",
+    });
+}
+
+pub fn printPacks(w: *std.Io.Writer, packs: []const packs_mod.PackInfo, summary: *const packs_mod.PacksSummary) WriteError!void {
     try w.writeAll("PACK                          OBJECTS     PHYSICAL SIZE\n");
     var hbuf: [64]u8 = undefined;
     for (packs) |p| {
@@ -175,6 +234,52 @@ pub fn printPacks(w: *std.Io.Writer, packs: []const packs_mod.PackInfo) WriteErr
         pad = if (count_str.len < 12) 12 - count_str.len else 1;
         while (pad > 0) : (pad -= 1) try w.writeByte(' ');
         try w.print("{s}\n", .{formatSize(&hbuf, p.pack_bytes)});
+    }
+
+    var any_deltas = false;
+    for (packs) |p| {
+        if (p.delta_count > 0) {
+            any_deltas = true;
+            break;
+        }
+    }
+    if (any_deltas) {
+        try w.writeAll("\nDelta compression\n");
+        for (packs) |p| {
+            if (p.delta_count == 0) continue;
+            try w.print("  {s}", .{p.name});
+            var pad: usize = if (p.name.len < 28) 28 - p.name.len else 1;
+            while (pad > 0) : (pad -= 1) try w.writeByte(' ');
+            var lbuf: [32]u8 = undefined;
+            const logical = formatSize(&lbuf, p.delta_logical_bytes);
+            const pct: u64 = if (p.delta_logical_bytes > 0)
+                (p.delta_physical_bytes * 100) / p.delta_logical_bytes
+            else
+                0;
+            try w.print("{d} deltas   max depth {d}   mean {d:.2}   {s} stored for {s} logical ({d}%)\n", .{
+                p.delta_count,
+                p.max_delta_depth,
+                p.meanDeltaDepth(),
+                formatSize(&hbuf, p.delta_physical_bytes),
+                logical,
+                pct,
+            });
+        }
+    }
+
+    try w.writeAll("\nPack fragmentation\n");
+    var cbuf: [24]u8 = undefined;
+    try printPadded(w, "Packs", std.fmt.bufPrint(&cbuf, "{d}", .{summary.pack_count}) catch unreachable, 22);
+    if (summary.smallest) |s| {
+        const line = std.fmt.bufPrint(&hbuf, "{s} ({s})", .{ formatSize(&cbuf, s.bytes), s.name }) catch unreachable;
+        try printPadded(w, "Smallest", line, 22);
+    }
+    if (summary.largest) |l| {
+        const line = std.fmt.bufPrint(&hbuf, "{s} ({s})", .{ formatSize(&cbuf, l.bytes), l.name }) catch unreachable;
+        try printPadded(w, "Largest", line, 22);
+    }
+    if (summary.repack_hint) |hint| {
+        try w.print("\nhint: {s}\n", .{hint});
     }
 }
 
