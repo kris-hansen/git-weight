@@ -129,6 +129,7 @@ fn stepParent(
     const payload = store.readPayload(scratch.allocator(), commit) catch return error.UnknownRevision;
     if (payload.object_type != .commit) return error.UnknownRevision;
     const c = commit_mod.parse(payload.data, commit.algorithm, scratch.allocator()) catch return error.UnknownRevision;
+    payload.release();
     if (n == 0 or n > c.parents.len) return error.UnknownRevision;
     return c.parents[n - 1];
 }

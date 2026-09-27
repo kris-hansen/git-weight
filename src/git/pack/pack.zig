@@ -287,26 +287,72 @@ pub const Pack = struct {
 
     pub const Payload = struct {
         object_type: git_object.ObjectType,
-        data: []u8,
+        /// Borrowed from the cache when `pin` is set (valid until `release`);
+        /// caller-owned otherwise (loose objects, oversized payloads).
+        data: []const u8,
+        pin: ?PayloadCache.Pin = null,
+
+        /// Drop the cache borrow, if any. `data` must not be used afterwards.
+        /// Call exactly once; skipping it on an error path between
+        /// readPayload and release only leaks the borrow until the store
+        /// (and its caches) is torn down.
+        pub fn release(self: Payload) void {
+            if (self.pin) |p| p.unpin();
+        }
     };
 
     /// Cache of reconstructed payloads by pack offset (the equivalent of
     /// git's delta base cache). Thread-safe: sharded by offset, each shard
-    /// spinlocked. When a shard exceeds its share of `budget` it is cleared
-    /// — delta chains are resolved and consumed in one burst, so chain-local
+    /// spinlocked. Entries are heap-allocated and handed out as borrowed
+    /// slices pinned by a refcount, so readers never copy: a pin keeps the
+    /// entry's bytes valid even after the shard evicts it; the entry is
+    /// reclaimed once no pins remain (at the next eviction sweep or at
+    /// deinit). When a shard exceeds its share of `budget` it is cleared —
+    /// delta chains are resolved and consumed in one burst, so chain-local
     /// reuse (the common case) survives clearing. Entries larger than
-    /// `max_entry_size` are never cached. Owns all cached bytes.
+    /// `max_entry_size` are never cached. Owns all cached bytes; live memory
+    /// stays within roughly 2x `budget` (map plus evicted-but-pinned).
     pub const PayloadCache = struct {
         pub const Entry = struct {
             object_type: git_object.ObjectType,
             data: []u8,
+            /// Outstanding pins. Bumped under the shard lock (lookup) and by
+            /// insert; dropped with a plain atomic in `Pin.unpin`, which
+            /// never touches any other field — so a concurrent unpin can
+            /// never race a reclaim.
+            refs: std.atomic.Value(u32) = .init(0),
+            /// Per-shard list of evicted entries awaiting reclaim.
+            orphan_next: ?*Entry = null,
         };
 
+        /// A borrow of a cache entry. The entry's bytes stay valid until
+        /// `unpin` is called, even if the shard evicts the entry meanwhile.
+        pub const Pin = struct {
+            cache: *PayloadCache,
+            shard: *Shard,
+            entry: *Entry,
+
+            /// Drop the borrow. After the last unpin the entry is reclaimed
+            /// at the next eviction sweep or at deinit; the payload bytes
+            /// must not be used after this call.
+            pub fn unpin(self: Pin) void {
+                _ = self.entry.refs.fetchSub(1, .release);
+            }
+        };
+
+        // Shard count trades contention against cache locality: delta chains
+        // live at nearby pack offsets, so neighbouring shards fill together
+        // during a burst, and the per-shard budget must survive one burst
+        // (plus in-flight neighbours) or resolution re-inflates evicted
+        // bases repeatedly.
         const n_shards = 16;
         const Shard = struct {
             mutex: std.atomic.Mutex = .unlocked,
-            map: std.AutoHashMapUnmanaged(u64, Entry) = .empty,
+            map: std.AutoHashMapUnmanaged(u64, *Entry) = .empty,
             total_bytes: u64 = 0,
+            /// Evicted entries with outstanding pins; swept (reclaiming
+            /// unpinned ones) at the next eviction.
+            orphans: ?*Entry = null,
         };
 
         allocator: std.mem.Allocator,
@@ -324,8 +370,18 @@ pub const Pack = struct {
         pub fn deinit(self: *PayloadCache) void {
             for (&self.shards) |*s| {
                 var it = s.map.iterator();
-                while (it.next()) |e| self.allocator.free(e.value_ptr.data);
+                while (it.next()) |e| {
+                    const entry = e.value_ptr.*;
+                    self.allocator.free(entry.data);
+                    self.allocator.destroy(entry);
+                }
                 s.map.deinit(self.allocator);
+                var orphan = s.orphans;
+                while (orphan) |entry| {
+                    orphan = entry.orphan_next;
+                    self.allocator.free(entry.data);
+                    self.allocator.destroy(entry);
+                }
             }
         }
 
@@ -333,48 +389,108 @@ pub const Pack = struct {
             return &self.shards[@intCast((offset >> 12) % n_shards)];
         }
 
-        /// Returns a copy of the cached payload (allocated from `dest`),
-        /// or null on a miss. The copy happens under the shard lock because
-        /// entries can be cleared at any time.
-        fn get(self: *PayloadCache, offset: u64, dest: std.mem.Allocator) ?Entry {
-            const s = self.shardFor(offset);
-            lockSpin(&s.mutex);
-            defer s.mutex.unlock();
-            const e = s.map.get(offset) orelse return null;
-            const copy = dest.dupe(u8, e.data) catch return null;
-            return .{ .object_type = e.object_type, .data = copy };
+        /// Whether a payload of `size` bytes may be cached.
+        pub fn cacheable(size: u64) bool {
+            return size <= max_entry_size;
         }
 
-        fn put(self: *PayloadCache, offset: u64, object_type: git_object.ObjectType, data: []const u8) void {
-            if (data.len > max_entry_size) return;
-            // Copy before taking the lock to shorten the critical section.
-            const copy = self.allocator.dupe(u8, data) catch return;
+        /// Look up `offset`, returning a pinned borrow of the cached payload
+        /// (no copy), or null on a miss. Call `Pin.unpin` when done.
+        fn pin(self: *PayloadCache, offset: u64) ?Pin {
             const s = self.shardFor(offset);
-            const shard_budget = self.budget / n_shards;
             lockSpin(&s.mutex);
             defer s.mutex.unlock();
-            if (s.map.contains(offset)) {
-                self.allocator.free(copy);
-                return;
+            const entry = s.map.get(offset) orelse return null;
+            _ = entry.refs.fetchAdd(1, .monotonic);
+            return .{ .cache = self, .shard = s, .entry = entry };
+        }
+
+        const InsertResult = struct { pin: Pin, dup: bool };
+
+        /// Insert `data` (cache-allocator owned; ownership transfers on
+        /// success) and return it pinned. On a duplicate offset the existing
+        /// entry is returned instead, `dup` is true, and `data` is left
+        /// unfreed for the caller to release. On allocator failure the
+        /// insert is skipped, null is returned, and `data` stays with the
+        /// caller. Freed eviction victims are unlinked under the lock but
+        /// released after it, so syscalls stay out of the critical section.
+        fn insert(self: *PayloadCache, offset: u64, object_type: git_object.ObjectType, data: []u8) ?InsertResult {
+            const s = self.shardFor(offset);
+            const shard_budget = self.budget / n_shards;
+            var victims: std.ArrayListUnmanaged(*Entry) = .empty;
+            defer victims.deinit(self.allocator);
+            lockSpin(&s.mutex);
+            var result: ?InsertResult = null;
+            if (s.map.get(offset)) |existing| {
+                _ = existing.refs.fetchAdd(1, .monotonic);
+                result = .{ .pin = .{ .cache = self, .shard = s, .entry = existing }, .dup = true };
+            } else {
+                if (s.total_bytes + data.len > shard_budget) self.evictAllLocked(s, &victims);
+                if (self.allocator.create(Entry)) |entry| {
+                    entry.* = .{ .object_type = object_type, .data = data };
+                    if (s.map.put(self.allocator, offset, entry)) {
+                        s.total_bytes += data.len;
+                        _ = entry.refs.fetchAdd(1, .monotonic);
+                        result = .{ .pin = .{ .cache = self, .shard = s, .entry = entry }, .dup = false };
+                    } else |_| {
+                        self.allocator.destroy(entry);
+                    }
+                } else |_| {}
             }
-            if (s.total_bytes + data.len > shard_budget) {
-                var it = s.map.iterator();
-                while (it.next()) |e| self.allocator.free(e.value_ptr.data);
-                s.map.clearRetainingCapacity();
-                s.total_bytes = 0;
+            s.mutex.unlock();
+            for (victims.items) |victim| {
+                self.allocator.free(victim.data);
+                self.allocator.destroy(victim);
             }
-            s.map.put(self.allocator, offset, .{ .object_type = object_type, .data = copy }) catch {
-                self.allocator.free(copy);
-                return;
-            };
-            s.total_bytes += copy.len;
+            return result;
+        }
+
+        /// Clear the shard when over budget. First reclaim orphaned entries
+        /// whose pins have been dropped, then move the map's entries to the
+        /// orphan list — entries with pins stay valid for their borrowers;
+        /// entries without pins are collected as victims and freed by the
+        /// caller once the lock is released. Caller holds the lock; no pin
+        /// or unpin can touch a victim (none are reachable from the map or
+        /// the orphan list, and unpins only ever touch `refs`).
+        fn evictAllLocked(self: *PayloadCache, s: *Shard, victims: *std.ArrayListUnmanaged(*Entry)) void {
+            var olink = &s.orphans;
+            while (olink.*) |entry| {
+                if (entry.refs.load(.acquire) == 0) {
+                    olink.* = entry.orphan_next;
+                    victims.append(self.allocator, entry) catch {
+                        // Tracking failed: reclaim inline (no pins, so no
+                        // borrower can race).
+                        self.allocator.free(entry.data);
+                        self.allocator.destroy(entry);
+                    };
+                } else {
+                    olink = &entry.orphan_next;
+                }
+            }
+            var it = s.map.iterator();
+            while (it.next()) |e| {
+                const entry = e.value_ptr.*;
+                s.total_bytes -= entry.data.len;
+                if (entry.refs.load(.acquire) == 0) {
+                    victims.append(self.allocator, entry) catch {
+                        self.allocator.free(entry.data);
+                        self.allocator.destroy(entry);
+                    };
+                } else {
+                    entry.orphan_next = s.orphans;
+                    s.orphans = entry;
+                }
+            }
+            s.map.clearRetainingCapacity();
         }
     };
 
     /// Fully reconstruct the object payload at `offset`. Payloads are
-    /// decompressed and delta-resolved; caller owns the memory. When `cache`
-    /// is given, reconstructed entries (including delta bases) are memoized
-    /// so repeated walks pay one inflation per object.
+    /// decompressed and delta-resolved. When `cache` is given, reconstructed
+    /// entries (including delta bases) are memoized so repeated walks pay one
+    /// inflation per object, and the returned payload borrows the cache entry
+    /// (pinned): call `Payload.release` when done. Without a cache (or for
+    /// payloads too large to cache) the caller owns the memory as before.
     pub fn readPayload(self: *const Pack, allocator: std.mem.Allocator, offset: u64, cache: ?*PayloadCache) PackError!Payload {
         return self.readPayloadDepth(allocator, offset, cache, 0);
     }
@@ -382,8 +498,8 @@ pub const Pack = struct {
     fn readPayloadDepth(self: *const Pack, allocator: std.mem.Allocator, offset: u64, cache: ?*PayloadCache, depth: usize) PackError!Payload {
         if (depth > max_delta_depth) return error.CorruptPack;
         if (cache) |c| {
-            if (c.get(offset, allocator)) |cached| {
-                return .{ .object_type = cached.object_type, .data = cached.data };
+            if (c.pin(offset)) |p| {
+                return .{ .object_type = p.entry.object_type, .data = p.entry.data, .pin = p };
             }
         }
         const raw = try self.readRawEntry(offset);
@@ -392,20 +508,58 @@ pub const Pack = struct {
                 var infl: inflate.Inflater = undefined;
                 infl.init(self.data[@intCast(raw.data_offset)..]);
                 defer infl.deinit();
-                const buf = allocator.alloc(u8, @intCast(raw.size)) catch return error.OutOfMemory;
-                errdefer allocator.free(buf);
-                infl.readAll(buf) catch return error.CorruptPack;
-                if (cache) |c| c.put(offset, raw.entry_type, buf);
+                // Cacheable payloads are allocated in cache-owned memory so
+                // the cache can hand them out without a copy; oversized ones
+                // stay caller-owned and are never cached.
+                const store = if (cache != null and PayloadCache.cacheable(raw.size)) cache.? else null;
+                const alloc = if (store) |c| c.allocator else allocator;
+                const buf = alloc.alloc(u8, @intCast(raw.size)) catch return error.OutOfMemory;
+                infl.readAll(buf) catch {
+                    alloc.free(buf);
+                    return error.CorruptPack;
+                };
+                if (store) |c| {
+                    if (c.insert(offset, raw.entry_type, buf)) |r| {
+                        if (r.dup) alloc.free(buf);
+                        return .{ .object_type = raw.entry_type, .data = r.pin.entry.data, .pin = r.pin };
+                    }
+                    // Insert failed (OOM): hand caller-owned memory back, as
+                    // the pin-null contract requires.
+                    const copy = allocator.dupe(u8, buf) catch {
+                        alloc.free(buf);
+                        return error.OutOfMemory;
+                    };
+                    alloc.free(buf);
+                    return .{ .object_type = raw.entry_type, .data = copy };
+                }
                 return .{ .object_type = raw.entry_type, .data = buf };
             },
             .ofs_delta, .ref_delta => {
                 const base_offset = try self.baseOffset(raw.base);
                 const base = try self.readPayloadDepth(allocator, base_offset, cache, depth + 1);
-                defer allocator.free(base.data);
+                defer base.release();
+                defer if (base.pin == null) allocator.free(base.data);
                 const stream = try self.inflateDeltaStream(allocator, raw.data_offset, raw.size);
                 defer allocator.free(stream);
-                const out = delta.applyDelta(allocator, base.data, stream) catch return error.CorruptPack;
-                if (cache) |c| c.put(offset, base.object_type, out);
+                // Peek the reconstructed size to pick the owner up front.
+                var vpos: usize = 0;
+                _ = delta.readVarint(stream, &vpos) orelse return error.CorruptPack;
+                const tgt_size = delta.readVarint(stream, &vpos) orelse return error.CorruptPack;
+                const store = if (cache != null and PayloadCache.cacheable(tgt_size)) cache.? else null;
+                const alloc = if (store) |c| c.allocator else allocator;
+                const out = delta.applyDelta(alloc, base.data, stream) catch return error.CorruptPack;
+                if (store) |c| {
+                    if (c.insert(offset, base.object_type, out)) |r| {
+                        if (r.dup) alloc.free(out);
+                        return .{ .object_type = base.object_type, .data = r.pin.entry.data, .pin = r.pin };
+                    }
+                    const copy = allocator.dupe(u8, out) catch {
+                        alloc.free(out);
+                        return error.OutOfMemory;
+                    };
+                    alloc.free(out);
+                    return .{ .object_type = base.object_type, .data = copy };
+                }
                 return .{ .object_type = base.object_type, .data = out };
             },
         }

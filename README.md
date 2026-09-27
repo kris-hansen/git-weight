@@ -34,6 +34,19 @@ git-weight --json > weight-report.json
 
 All analysis is read-only.
 
+### Remediation guidance
+
+`explain` doesn't just diagnose bloat — it prints the fix. A **Remediation**
+section tailors exact commands to the verdict: `git reflog expire --expire=now
+--all && git gc --prune=now --aggressive` for unreachable objects,
+`git filter-repo`/`bfg` one-liners for files retained only by history (with
+the caveat that rewriting history means force-pushing and having collaborators
+re-clone), and a commit-then-rewrite note for files still present at HEAD.
+Blobs that belong in Git LFS — logical size ≥ 5 MiB or a known-binary
+extension — get a `git lfs migrate import` suggestion. `--json` exposes all of
+this as a structured `remediation` object, and `largest --json` marks each
+blob with `lfs_candidate` for automation.
+
 Update to the latest release with:
 
 ```sh

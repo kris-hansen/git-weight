@@ -61,6 +61,7 @@ pub fn peelToCommit(store: *const object_store.ObjectStore, id: *const object_id
             defer scratch.deinit();
             const payload = store.readPayload(scratch.allocator(), id) catch return null;
             const t = tag_mod.parse(payload.data, id.algorithm) catch return null;
+            payload.release();
             return peelToCommit(store, &t.object, depth + 1);
         },
         else => return null,
@@ -202,6 +203,7 @@ pub fn compute(
                 defer tscratch.deinit();
                 const payload = store.readPayload(tscratch.allocator(), &target) catch break;
                 const t = tag_mod.parse(payload.data, target.algorithm) catch break;
+                payload.release();
                 target = t.object;
             }
             // The final non-tag target of an annotated tag chain.
@@ -222,6 +224,7 @@ pub fn compute(
         const payload = store.readPayload(bfs_scratch.allocator(), &id) catch continue;
         if (payload.object_type != .commit) continue;
         const c = commit_mod.parse(payload.data, id.algorithm, bfs_scratch.allocator()) catch continue;
+        payload.release();
         try commits.append(allocator, .{ .id = id, .tree = c.tree });
         for (c.parents) |p| {
             if (visited.contains(p)) continue;
@@ -362,6 +365,7 @@ fn headTree(store: *const object_store.ObjectStore, commit_oid: *const object_id
     const payload = try store.readPayload(scratch.allocator(), commit_oid);
     if (payload.object_type != .commit) return error.CorruptRepository;
     const c = try commit_mod.parse(payload.data, commit_oid.algorithm, scratch.allocator());
+    payload.release();
     return c.tree;
 }
 
@@ -383,6 +387,10 @@ fn walkTree(
 
     const payload = store.readPayload(scratch, tree_oid) catch return;
     if (payload.object_type != .tree) return;
+    // Held across the recursive reads below: the iterator borrows payload
+    // data (entry names), and the pin keeps it valid even if a nested read
+    // evicts this entry from the cache.
+    defer payload.release();
 
     const base_len = prefix.items.len;
     var it = tree_mod.TreeIterator.init(payload.data, tree_oid.algorithm);

@@ -161,11 +161,14 @@ pub const ObjectStore = struct {
             info_cache.* = .empty;
 
             // The payload cache evicts and frees entries; it must use a
-            // freeing allocator, not the process-wide arena. It is
-            // thread-safe (sharded locks) and shared by all workers.
+            // freeing allocator, not the process-wide arena. Small
+            // heterogeneous allocations (entries, map nodes, payloads) make
+            // the page allocator syscall-heavy, so use the thread-safe
+            // bucket allocator. The cache itself (sharded locks) is shared
+            // by all workers.
             const payload_cache = try self.allocator.create(pack_mod.Pack.PayloadCache);
             errdefer self.allocator.destroy(payload_cache);
-            payload_cache.* = pack_mod.Pack.PayloadCache.init(std.heap.page_allocator);
+            payload_cache.* = pack_mod.Pack.PayloadCache.init(std.heap.smp_allocator);
 
             const path_copy = try self.allocator.dupe(u8, pack_path);
             errdefer self.allocator.free(path_copy);
@@ -223,6 +226,19 @@ pub const ObjectStore = struct {
 
     /// Resolve type and logical size for an object (delta chains walked).
     pub fn info(self: *const ObjectStore, id: *const object_id.ObjectId) StoreError!Info {
+        return self.infoWithCache(self.allocator, id, null);
+    }
+
+    /// Like info, but memoizes pack delta chains through caller-provided
+    /// per-pack caches: parallel workers pass one cache per pack, since the
+    /// store's built-in info caches are not thread-safe. `allocator` backs
+    /// the resolution chain and cache growth.
+    pub fn infoWithCache(
+        self: *const ObjectStore,
+        allocator: std.mem.Allocator,
+        id: *const object_id.ObjectId,
+        caches: ?[]pack_mod.Pack.InfoCache,
+    ) StoreError!Info {
         switch (self.locate(id)) {
             .missing => return error.CorruptRepository,
             .loose => |i| {
@@ -235,7 +251,8 @@ pub const ObjectStore = struct {
             },
             .pack => |loc| {
                 const pf = &self.packs.items[loc.pack_id];
-                const inf = pf.pack.infoAtCached(pf.info_cache, self.allocator, loc.offset) catch return error.CorruptRepository;
+                const cache = if (caches) |c| &c[loc.pack_id] else pf.info_cache;
+                const inf = pf.pack.infoAtCached(cache, allocator, loc.offset) catch return error.CorruptRepository;
                 return .{ .object_type = inf.object_type, .size = inf.size };
             },
         }
@@ -243,10 +260,23 @@ pub const ObjectStore = struct {
 
     pub const Payload = struct {
         object_type: git_object.ObjectType,
-        data: []u8,
+        /// Borrowed from the pack payload cache when `pin` is set (valid
+        /// until `release`); caller-owned otherwise (loose objects).
+        data: []const u8,
+        pin: ?pack_mod.Pack.PayloadCache.Pin = null,
+
+        /// Drop the cache borrow, if any. `data` must not be used afterwards.
+        /// Call exactly once, after the last use of `data`; skipping it on an
+        /// error path only leaks the borrow until store teardown.
+        pub fn release(self: Payload) void {
+            if (self.pin) |p| p.unpin();
+        }
     };
 
-    /// Fully reconstruct an object's payload. Caller frees `data`.
+    /// Fully reconstruct an object's payload. For pack objects the payload
+    /// borrows the shared cache entry, pinned: call `Payload.release` after
+    /// the last use of `data` (the borrow survives concurrent cache
+    /// eviction until then). Loose payloads are caller-owned as before.
     /// Thread-safe: the shared payload cache takes care of synchronization.
     pub fn readPayload(self: *const ObjectStore, allocator: std.mem.Allocator, id: *const object_id.ObjectId) StoreError!Payload {
         switch (self.locate(id)) {
@@ -266,7 +296,7 @@ pub const ObjectStore = struct {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => return error.CorruptRepository,
                 };
-                return .{ .object_type = r.object_type, .data = r.data };
+                return .{ .object_type = r.object_type, .data = r.data, .pin = r.pin };
             },
         }
     }

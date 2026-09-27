@@ -253,11 +253,13 @@ fn record(
                 .historical_only => status == .historical,
             };
             if (keep) {
+                const entry_path = pm.pathOf(id);
                 const entry: largest_mod.BlobEntry = .{
                     .id = id.*,
                     .size = size,
-                    .path = pm.pathOf(id),
+                    .path = entry_path,
                     .status = status,
+                    .lfs_candidate = largest_mod.isLfsCandidate(size, entry_path),
                 };
                 if (out.heap.count() < ctx.limit) {
                     try out.heap.push(allocator, entry);

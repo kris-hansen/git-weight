@@ -213,6 +213,8 @@ fn writeBlobEntry(jw: *JsonWriter, c: *const largest_mod.BlobEntry) WriteError!v
     try jw.writeOptPath(c.path);
     try jw.field("status");
     try jw.writeString(c.status.name());
+    try jw.field("lfs_candidate");
+    try writeBool(jw, c.lfs_candidate);
     try jw.endObject();
 }
 
@@ -353,8 +355,42 @@ pub fn printExplain(jw: *JsonWriter, target: []const u8, report: *const explain_
     try writeBool(jw, report.reachable_from_head);
     try jw.field("reclaimable_bytes");
     try jw.writeU64(report.reclaimable_bytes);
+    try jw.field("remediation");
+    try writeRemediation(jw, &report.remediation);
     try jw.endObject();
     try jw.w.writeByte('\n');
+}
+
+fn writeRemediation(jw: *JsonWriter, rem: *const explain_mod.Remediation) WriteError!void {
+    try jw.beginObject();
+    try jw.field("verdict");
+    try jw.writeString(rem.verdict.name());
+    try jw.field("commands");
+    try jw.beginArray();
+    for (rem.commands) |c| {
+        try jw.beforeField();
+        try jw.beginObject();
+        try jw.field("tool");
+        try jw.writeString(c.tool);
+        try jw.field("command");
+        try jw.writeString(c.command);
+        try jw.endObject();
+    }
+    try jw.endArray();
+    try jw.field("caveat");
+    if (rem.caveat) |c| try jw.writeString(c) else try jw.w.writeAll("null");
+    try jw.field("lfs");
+    if (rem.lfs) |l| {
+        try jw.beginObject();
+        try jw.field("pattern");
+        try jw.writeString(l.pattern);
+        try jw.field("command");
+        try jw.writeString(l.command);
+        try jw.endObject();
+    } else {
+        try jw.w.writeAll("null");
+    }
+    try jw.endObject();
 }
 
 fn writeChangedSide(jw: *JsonWriter, ref: []const u8, commit: object_id_mod.ObjectId, entry: ?changed_mod.Entry) WriteError!void {
