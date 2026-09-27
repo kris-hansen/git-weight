@@ -13,6 +13,20 @@ pub const ScanError = error{
     CorruptRepository,
 };
 
+/// Read-only reachability view over either a Reachable set or a PathMap's
+/// reachable set.
+pub const ReachableView = union(enum) {
+    set: *const reachability.Reachable,
+    map: *const paths_mod.PathMap,
+
+    pub fn contains(self: ReachableView, id: *const object_id.ObjectId) bool {
+        return switch (self) {
+            .set => |r| r.contains(id),
+            .map => |m| m.reachable.contains(id.*),
+        };
+    }
+};
+
 pub const ScanResult = struct {
     stats: object_store.ObjectStats,
     /// Top blobs by logical size (empty when no path map was given).
@@ -28,7 +42,7 @@ pub const ScanResult = struct {
 pub fn fullScan(
     store: *object_store.ObjectStore,
     path_map: ?*const paths_mod.PathMap,
-    reachable: ?*const reachability.Reachable,
+    reachable: ?ReachableView,
     limit: usize,
     min_size: u64,
     filter: largest_mod.Filter,
@@ -141,7 +155,7 @@ const ShardResult = struct {
 const Ctx = struct {
     store: *object_store.ObjectStore,
     path_map: ?*const paths_mod.PathMap,
-    reachable: ?*const reachability.Reachable,
+    reachable: ?ReachableView,
     limit: usize,
     min_size: u64,
     filter: largest_mod.Filter,

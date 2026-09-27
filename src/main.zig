@@ -224,11 +224,35 @@ fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.I
             }
         },
         .@"unreachable" => {
-            var all = reachability.computeAll(&store, &refs, allocator) catch |err| {
-                return reportAnalysisError(errw, err);
+            var path_map = paths.compute(&store, &refs, allocator) catch {
+                return fail(errw, exit_general, "error: failed to resolve paths");
             };
-            defer all.deinit();
-            const scan_r = scan_mod.fullScan(&store, null, &all, 0, 0, .all, allocator) catch |err| {
+            defer path_map.deinit();
+            timer.mark("paths: {d} blob paths in", .{path_map.paths.count()});
+            var view: scan_mod.ReachableView = .{ .map = &path_map };
+            // The paths walk records only the tip object of refs that target
+            // a tree or blob (directly or via an annotated tag); walk those
+            // fully so their entries stay reachable.
+            var extra: ?reachability.Reachable = null;
+            defer if (extra) |*e| e.deinit();
+            for (refs.refs.items) |r| {
+                if (paths.peelToCommit(&store, &r.target, 0) != null) continue;
+                if (extra == null) extra = reachability.copyReachable(allocator, &path_map.reachable) catch {
+                    return fail(errw, exit_general, "error: out of memory");
+                };
+                var sub = reachability.computeFromTips(&store, &.{r.target}, allocator) catch |err| {
+                    return reportAnalysisError(errw, err);
+                };
+                defer sub.deinit();
+                var sit = sub.set.keyIterator();
+                while (sit.next()) |k| {
+                    extra.?.set.put(allocator, k.*, {}) catch {
+                        return fail(errw, exit_general, "error: out of memory");
+                    };
+                }
+            }
+            if (extra) |*e| view = .{ .set = e };
+            const scan_r = scan_mod.fullScan(&store, null, view, 0, 0, .all, allocator) catch |err| {
                 return reportAnalysisError(errw, err);
             };
             var stats = scan_r.unreachable_stats;
