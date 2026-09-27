@@ -14,6 +14,7 @@ const reachability = @import("analysis/reachability.zig");
 const refs_analysis = @import("analysis/refs.zig");
 const explain_mod = @import("analysis/explain.zig");
 const changed_mod = @import("analysis/changed.zig");
+const check_mod = @import("analysis/check.zig");
 const scan_mod = @import("analysis/scan.zig");
 
 const ExitCode = u8;
@@ -23,6 +24,7 @@ pub const exit_invalid_args: ExitCode = 2;
 pub const exit_not_found: ExitCode = 3;
 pub const exit_unsupported: ExitCode = 4;
 pub const exit_corrupt: ExitCode = 5;
+pub const exit_threshold: ExitCode = 6;
 
 /// Phase timer for `--verbose`: each mark prints the delta since the
 /// previous mark and the cumulative total.
@@ -74,6 +76,7 @@ comptime {
     _ = @import("analysis/refs.zig");
     _ = @import("analysis/explain.zig");
     _ = @import("analysis/changed.zig");
+    _ = @import("analysis/check.zig");
     _ = @import("analysis/scan.zig");
     _ = @import("platform/mmap.zig");
     _ = @import("platform/filesystem.zig");
@@ -350,6 +353,22 @@ fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.I
                 output.printChanged(w, &report) catch return exit_general;
             }
             if (opts.exit_code) return if (report.changed) exit_general else exit_success;
+        },
+        .check => {
+            const s = summary.build(allocator, &repo, &store, &refs) catch |err| {
+                return reportAnalysisError(errw, err);
+            };
+            timer.mark("analysis: summary in", .{});
+            const check = check_mod.build(allocator, &s, opts.max_size, opts.max_historical, opts.max_unreachable, opts.max_blob) catch {
+                return fail(errw, exit_general, "error: out of memory");
+            };
+            if (opts.json) {
+                var jw: json.JsonWriter = .{ .w = w };
+                json.printCheck(&jw, &s, &check) catch return exit_general;
+            } else {
+                output.printCheck(w, &check) catch return exit_general;
+            }
+            if (!check.allOk()) return exit_threshold;
         },
     }
 

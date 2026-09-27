@@ -67,6 +67,7 @@ Commands:
   refs         Refs retaining historical weight
   unreachable  Unreachable objects reclaimable via git gc
   changed      Whether a path changed between two revisions (CI)
+  check        Threshold checks for CI gating (see --max-* options)
 
 Options:
   --json             Machine-readable JSON output
@@ -76,6 +77,10 @@ Options:
   --base REF         Base revision for 'changed' (default HEAD~1)
   --to REF           Target revision for 'changed' (default HEAD)
   --exit-code        For 'changed': exit 1 when changed, 0 when unchanged
+  --max-size SIZE    For 'check': fail if total .git size exceeds SIZE
+  --max-historical SIZE  For 'check': fail if historical deleted bytes exceed SIZE
+  --max-unreachable SIZE For 'check': fail if gc-reclaimable bytes exceed SIZE
+  --max-blob SIZE    For 'check': fail if the largest blob exceeds SIZE
   --current          Only blobs present in the tree at HEAD
   --historical       Only blobs not present in the tree at HEAD
   --no-color         Disable colored output
@@ -143,6 +148,21 @@ fi
 
 `--base` defaults to `HEAD~1` and `--to` to `HEAD`; both accept ref names, full hex oids, and ancestry suffixes (`~N`, `^N`, e.g. `HEAD~2^1`). Annotated tags are peeled to their commits. With `--json`, each side is reported as `{"ref": ..., "commit": ..., "tree": ...}`, where `tree` holds the subtree or blob oid at the path (null when the path is absent on that side).
 
+### CI gating
+
+`git-weight check` fails the build when repository storage crosses configured thresholds. It runs the same analysis as `summary` and evaluates one or more `--max-*` limits, exiting 0 when all pass and 6 when any threshold is exceeded:
+
+```sh
+# Fail CI if the repository is getting too heavy.
+git-weight check \
+    --max-size 500MB \
+    --max-historical 100MB \
+    --max-unreachable 50MB \
+    --max-blob 20MB
+```
+
+Each threshold compares against a value from the summary report: `--max-size` against the total `.git` size, `--max-historical` against bytes of deleted-at-HEAD content, `--max-unreachable` against physical bytes reclaimable via `git gc`, and `--max-blob` against the largest single blob. At least one threshold is required. With `--json`, results are reported as `{"repository": {...}, "thresholds": [{"name", "limit", "actual", "ok"}], "ok": ...}` for machine-readable CI logs.
+
 ### Terminology
 
 | Term        | Meaning                                                        |
@@ -163,6 +183,7 @@ fi
 | 3    | repository not found  |
 | 4    | unsupported Git format|
 | 5    | corrupt repository    |
+| 6    | threshold exceeded (`check`) |
 
 ## Performance
 

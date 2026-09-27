@@ -371,6 +371,39 @@ This command should clearly distinguish between:
 
 ---
 
+## 6.8 `git-weight check`
+
+Threshold checks for CI gating (implemented).
+
+```bash
+git-weight check --max-size 500MB --max-blob 20MB
+```
+
+At least one threshold is required; each `--max-*` option takes a size (e.g. `10MB`, `500KiB`):
+
+- `--max-size SIZE` — total `.git` size
+- `--max-historical SIZE` — bytes of historical (deleted-at-HEAD) content
+- `--max-unreachable SIZE` — physical bytes reclaimable via `git gc`
+- `--max-blob SIZE` — largest single blob by logical size
+
+Example:
+
+```text
+Thresholds
+
+  CHECK              LIMIT        ACTUAL       RESULT
+  max-size           500 MB       206 KB       ok
+  max-blob           20.0 MB      22.2 MB      FAIL
+
+Verdict: FAIL
+```
+
+The analysis reuses the summary pass, so `check` costs about the same as one `summary` run. Exit code 6 means a threshold was exceeded; 0 means all configured thresholds passed. With `--json`, output is `{"repository": {...}, "thresholds": [{"name", "limit", "actual", "ok"}], "ok": ...}`.
+
+Growth-based checks (`--max-growth`) remain future work (see §36).
+
+---
+
 # 7. Terminology
 
 `git-weight` should use consistent terminology.
@@ -1082,6 +1115,7 @@ Suggested:
 3    repository not found
 4    unsupported Git format
 5    corrupt repository
+6    threshold exceeded ('check')
 ```
 
 Automation should be able to depend on these values.
@@ -1231,6 +1265,10 @@ Identify commits responsible for the largest increases in repository weight.
 ---
 
 ## CI regression detection
+
+Implemented as `git-weight check` (see §6.8): threshold checks on current repository data (`--max-size`, `--max-historical`, `--max-unreachable`, `--max-blob`), exiting 6 when a threshold is exceeded.
+
+Growth-based checks remain future work:
 
 ```bash
 git-weight check --max-growth 10MB
