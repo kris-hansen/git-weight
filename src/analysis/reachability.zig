@@ -51,6 +51,7 @@ pub fn computeFromTips(
             .commit => {
                 const payload = store.readPayload(scratch.allocator(), &id) catch continue;
                 const c = commit_mod.parse(payload.data, id.algorithm, scratch.allocator()) catch continue;
+                payload.release();
                 try stack.append(allocator, c.tree);
                 try stack.appendSlice(allocator, c.parents);
             },
@@ -63,10 +64,12 @@ pub fn computeFromTips(
                         .submodule => {},
                     }
                 }
+                payload.release();
             },
             .tag => {
                 const payload = store.readPayload(scratch.allocator(), &id) catch continue;
                 const t = tag_mod.parse(payload.data, id.algorithm) catch continue;
+                payload.release();
                 try stack.append(allocator, t.object);
             },
             else => {},

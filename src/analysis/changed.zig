@@ -43,6 +43,7 @@ pub fn treeEntryAtPath(
     const commit_payload = store.readPayload(scratch.allocator(), commit_oid) catch return error.CorruptRepository;
     if (commit_payload.object_type != .commit) return error.CorruptRepository;
     const c = commit_mod.parse(commit_payload.data, commit_oid.algorithm, scratch.allocator()) catch return error.CorruptRepository;
+    commit_payload.release();
     var current = c.tree;
 
     if (path.len == 0 or std.mem.eql(u8, path, ".")) {
@@ -77,6 +78,8 @@ pub fn treeEntryAtPath(
                 break;
             }
         }
+        payload.release();
+        // Only mode/id are used below; entry names borrow the payload.
         const entry = found orelse return null;
         if (last) {
             return .{ .id = entry.id, .is_tree = entry.entryMode() == .tree };

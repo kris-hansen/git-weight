@@ -137,6 +137,7 @@ fn accumulateUniqueMasks(
             .commit => {
                 const payload = store.readPayload(scratch.allocator(), &e.id) catch continue;
                 const c = commit_mod.parse(payload.data, e.id.algorithm, scratch.allocator()) catch continue;
+                payload.release();
                 try stack.append(allocator, .{ .id = c.tree, .mask = e.mask });
                 for (c.parents) |p| try stack.append(allocator, .{ .id = p, .mask = e.mask });
             },
@@ -149,10 +150,12 @@ fn accumulateUniqueMasks(
                         .submodule => {},
                     }
                 }
+                payload.release();
             },
             .tag => {
                 const payload = store.readPayload(scratch.allocator(), &e.id) catch continue;
                 const t = tag_mod.parse(payload.data, e.id.algorithm) catch continue;
+                payload.release();
                 try stack.append(allocator, .{ .id = t.object, .mask = e.mask });
             },
             else => {},
