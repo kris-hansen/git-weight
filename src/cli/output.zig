@@ -120,6 +120,7 @@ pub fn printLargest(w: *std.Io.Writer, entries: []const largest_mod.BlobEntry) W
     try w.writeAll("SIZE       OBJECT        PATH\n");
     var hbuf: [64]u8 = undefined;
     var obuf: [64]u8 = undefined;
+    var lfs_count: usize = 0;
     for (entries) |e| {
         const size_str = formatSize(&hbuf, e.size);
         const oid_str = e.id.abbrev(&obuf, 7);
@@ -131,6 +132,13 @@ pub fn printLargest(w: *std.Io.Writer, entries: []const largest_mod.BlobEntry) W
         while (pad > 0) : (pad -= 1) try w.writeByte(' ');
         try w.print("{s}", .{e.path orelse "(unknown)"});
         try w.writeAll("\n");
+        if (e.lfs_candidate) lfs_count += 1;
+    }
+    if (lfs_count > 0) {
+        try w.print("\n{d} of {d} listed blobs are Git LFS candidates (see lfs_candidate in --json)\n", .{
+            lfs_count,
+            entries.len,
+        });
     }
 }
 
@@ -252,6 +260,32 @@ pub fn printExplain(w: *std.Io.Writer, report: *const explain_mod.Report) WriteE
         try w.print("  {s} if all retaining refs and history are rewritten\n", .{formatSize(&sbuf, report.reclaimable_bytes)});
     } else {
         try w.writeAll("  none — this object is part of the current tree\n");
+    }
+
+    try w.writeAll("\nRemediation\n\n");
+    const rem = &report.remediation;
+    switch (rem.verdict) {
+        .gc => {
+            for (rem.commands) |c| try w.print("  {s}\n", .{c.command});
+        },
+        .history_rewrite => {
+            if (rem.commands.len == 0) {
+                try w.writeAll("  Reclaiming this requires rewriting history,\n  but no path is known for the object, so no exact command can be given.\n");
+            } else {
+                for (rem.commands) |c| try w.print("  {s}\n", .{c.command});
+                if (rem.caveat) |c| try w.print("\n  {s}\n", .{c});
+            }
+        },
+        .none => {
+            try w.writeAll("  Nothing is reclaimable while the object remains in the current tree.\n");
+            if (report.object_type == .blob) {
+                try w.writeAll("  Start by committing the file's deletion; reclaiming the\n  already-committed bytes then requires a history rewrite.\n");
+            }
+        },
+    }
+    if (rem.lfs) |lfs| {
+        try w.print("  Git LFS candidate: {s}\n", .{lfs.command});
+        try w.writeAll("  (this also rewrites history — see the caveat above)\n");
     }
 }
 

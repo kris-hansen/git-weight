@@ -10,6 +10,7 @@ const loose_mod = @import("../git/loose.zig");
 const pack_mod = @import("../git/pack/pack.zig");
 const paths_mod = @import("paths.zig");
 const reachability = @import("reachability.zig");
+const largest_mod = @import("largest.zig");
 
 const max_workers = 64;
 
@@ -21,6 +22,149 @@ pub const ExplainError = error{
     UnsupportedFormat,
     Unexpected,
 };
+
+/// A single remediation step: a tool name plus the exact command line.
+/// `command` is owned by the Remediation; `tool` is a literal.
+pub const Command = struct {
+    tool: []const u8,
+    command: []const u8,
+};
+
+/// What reclaiming the object requires, mirroring the reclaimable verdict.
+pub const Verdict = enum {
+    /// Unreachable: reclaimable via standard gc.
+    gc,
+    /// Reachable but not in the HEAD tree: requires history rewriting.
+    history_rewrite,
+    /// Part of the current tree: nothing reclaimable today.
+    none,
+
+    pub fn name(self: Verdict) []const u8 {
+        return switch (self) {
+            .gc => "gc",
+            .history_rewrite => "history_rewrite",
+            .none => "none",
+        };
+    }
+};
+
+/// Copy-pasteable fix for the diagnosed object. Only ever contains commands
+/// for a verdict the analysis actually computed; `commands` may be empty
+/// when no exact command can be derived (e.g. no known path), in which case
+/// `caveat` explains what is required. All strings are owned.
+pub const Remediation = struct {
+    verdict: Verdict,
+    commands: []Command,
+    /// Owned warning that accompanies history-rewriting steps, or null.
+    caveat: ?[]const u8,
+    /// Git LFS migration plan for a candidate blob still present at HEAD.
+    lfs: ?LfsPlan,
+
+    pub const LfsPlan = struct {
+        /// include-pattern for `git lfs migrate` (`*.ext`, or the path).
+        pattern: []const u8,
+        command: []const u8,
+    };
+
+    pub fn deinit(self: *Remediation, allocator: std.mem.Allocator) void {
+        for (self.commands) |c| allocator.free(c.command);
+        allocator.free(self.commands);
+        if (self.caveat) |c| allocator.free(c);
+        if (self.lfs) |l| {
+            allocator.free(l.pattern);
+            allocator.free(l.command);
+        }
+    }
+};
+
+/// Wrap `s` in single quotes for safe shell pasting (embedded quotes become
+/// '\'').
+fn shellQuote(allocator: std.mem.Allocator, s: []const u8) ExplainError![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '\'');
+    for (s) |c| {
+        if (c == '\'') {
+            try out.appendSlice(allocator, "'\\''");
+        } else {
+            try out.append(allocator, c);
+        }
+    }
+    try out.append(allocator, '\'');
+    return out.toOwnedSlice(allocator) catch return error.OutOfMemory;
+}
+
+fn basename(path: []const u8) []const u8 {
+    return if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| path[i + 1 ..] else path;
+}
+
+/// Derive the remediation playbook strictly from the computed verdict.
+/// `path` may be null (e.g. an unreachable blob no tree references); no
+/// path-dependent command is emitted without one.
+pub fn buildRemediation(
+    allocator: std.mem.Allocator,
+    object_type: git_object.ObjectType,
+    logical_bytes: u64,
+    path: ?[]const u8,
+    reachable: bool,
+    reachable_from_head: bool,
+) ExplainError!Remediation {
+    var commands: std.ArrayList(Command) = .empty;
+    errdefer commands.deinit(allocator);
+    var caveat: ?[]const u8 = null;
+    var lfs: ?Remediation.LfsPlan = null;
+
+    const verdict: Verdict = if (!reachable)
+        .gc
+    else if (!reachable_from_head)
+        .history_rewrite
+    else
+        .none;
+
+    switch (verdict) {
+        .gc => try commands.append(allocator, .{
+            .tool = "git",
+            .command = try allocator.dupe(
+                u8,
+                "git reflog expire --expire=now --all && git gc --prune=now --aggressive",
+            ),
+        }),
+        .history_rewrite => {
+            if (path) |p| {
+                const quoted = try shellQuote(allocator, p);
+                defer allocator.free(quoted);
+                const filter_repo = std.fmt.allocPrint(allocator, "git filter-repo --invert-paths --path {s}", .{quoted}) catch return error.OutOfMemory;
+                const bfg = std.fmt.allocPrint(allocator, "bfg --delete-files {s}", .{basename(p)}) catch return error.OutOfMemory;
+                try commands.append(allocator, .{ .tool = "git-filter-repo", .command = filter_repo });
+                try commands.append(allocator, .{ .tool = "BFG Repo-Cleaner", .command = bfg });
+                caveat = try allocator.dupe(u8, "Rewrites history: force-push afterwards and have collaborators re-clone. Never rewrite shared history casually.");
+            }
+        },
+        .none => {
+            // LFS only helps blobs that remain in the tree; for historical
+            // blobs the filter-repo step above is the fix.
+            if (object_type == .blob and largest_mod.isLfsCandidate(logical_bytes, path)) {
+                const pattern = if (largest_mod.extensionOf(path.?)) |ext|
+                    std.fmt.allocPrint(allocator, "*.{s}", .{ext}) catch return error.OutOfMemory
+                else
+                    try allocator.dupe(u8, path.?);
+                const qpattern = try shellQuote(allocator, pattern);
+                defer allocator.free(qpattern);
+                const command = std.fmt.allocPrint(allocator, "git lfs migrate import --include={s} --everything", .{
+                    qpattern,
+                }) catch return error.OutOfMemory;
+                lfs = .{ .pattern = pattern, .command = command };
+            }
+        },
+    }
+
+    return .{
+        .verdict = verdict,
+        .commands = commands.toOwnedSlice(allocator) catch return error.OutOfMemory,
+        .caveat = caveat,
+        .lfs = lfs,
+    };
+}
 
 /// A commit relevant to the target's history.
 pub const CommitRef = struct {
@@ -50,9 +194,12 @@ pub const Report = struct {
     reachable_from_head: bool,
     /// Physical bytes reclaimable if the object were dropped.
     reclaimable_bytes: u64,
+    /// Copy-pasteable remediation derived from the verdict above.
+    remediation: Remediation,
 
     pub fn deinit(self: *Report, allocator: std.mem.Allocator) void {
         allocator.free(self.retained_by);
+        self.remediation.deinit(allocator);
         if (self.introduced) |c| {
             if (c.author) |a| allocator.free(a);
         }
@@ -722,6 +869,7 @@ pub fn build(
         .reachable = reachable,
         .reachable_from_head = reachable_from_head,
         .reclaimable_bytes = physical,
+        .remediation = try buildRemediation(allocator, inf.object_type, inf.size, path, reachable, reachable_from_head),
     };
 }
 
@@ -839,4 +987,62 @@ test "pickHistory ignores present commits with present parents" {
     // Earliest introduction is c2 (time 90 < 100).
     try std.testing.expect(history.introduced.?.id.eql(&c2));
     try std.testing.expect(history.deleted == null);
+}
+
+test "buildRemediation gc verdict for unreachable objects" {
+    const a = std.testing.allocator;
+    var r = try buildRemediation(a, .blob, 700_000, null, false, false);
+    defer r.deinit(a);
+    try std.testing.expect(r.verdict == .gc);
+    try std.testing.expect(r.commands.len == 1);
+    try std.testing.expectEqualStrings("git", r.commands[0].tool);
+    try std.testing.expect(std.mem.indexOf(u8, r.commands[0].command, "git gc --prune=now --aggressive") != null);
+    try std.testing.expect(r.caveat == null);
+    try std.testing.expect(r.lfs == null);
+}
+
+test "buildRemediation history rewrite with exact path commands" {
+    const a = std.testing.allocator;
+    var r = try buildRemediation(a, .blob, 3_000_000, "database/prod.sql", true, false);
+    defer r.deinit(a);
+    try std.testing.expect(r.verdict == .history_rewrite);
+    try std.testing.expect(r.commands.len == 2);
+    try std.testing.expect(std.mem.indexOf(u8, r.commands[0].command, "git filter-repo --invert-paths --path 'database/prod.sql'") != null);
+    try std.testing.expectEqualStrings("bfg --delete-files prod.sql", r.commands[1].command);
+    try std.testing.expect(r.caveat != null and std.mem.indexOf(u8, r.caveat.?, "Rewrites history") != null);
+    // Historical blob: LFS does not apply.
+    try std.testing.expect(r.lfs == null);
+}
+
+test "buildRemediation emits no path commands without a known path" {
+    const a = std.testing.allocator;
+    var r = try buildRemediation(a, .blob, 3_000_000, null, true, false);
+    defer r.deinit(a);
+    try std.testing.expect(r.verdict == .history_rewrite);
+    try std.testing.expect(r.commands.len == 0);
+    try std.testing.expect(r.caveat == null);
+}
+
+test "buildRemediation lfs plan for current candidate blob" {
+    const a = std.testing.allocator;
+    var r = try buildRemediation(a, .blob, 1_000_000, "assets/demo.mov", true, true);
+    defer r.deinit(a);
+    try std.testing.expect(r.verdict == .none);
+    try std.testing.expect(r.commands.len == 0);
+    try std.testing.expect(r.lfs != null);
+    try std.testing.expectEqualStrings("*.mov", r.lfs.?.pattern);
+    try std.testing.expectEqualStrings("git lfs migrate import --include='*.mov' --everything", r.lfs.?.command);
+
+    // Small text file at HEAD: no remediation at all.
+    var plain = try buildRemediation(a, .blob, 100, "README.md", true, true);
+    defer plain.deinit(a);
+    try std.testing.expect(plain.verdict == .none);
+    try std.testing.expect(plain.lfs == null);
+}
+
+test "shellQuote escapes embedded quotes" {
+    const a = std.testing.allocator;
+    const q = try shellQuote(a, "it's/here");
+    defer a.free(q);
+    try std.testing.expectEqualStrings("'it'\\''s/here'", q);
 }

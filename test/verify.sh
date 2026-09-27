@@ -129,6 +129,28 @@ for b in blobs:
 print("ok: representative paths exist in history")
 PYEOF
 
+# lfs_candidate: the 3 MB database/prod.sql fixture blob is a candidate
+# (.sql is a curated dump extension); the small README blob is not.
+"$GW" largest --limit 100 --json > "$FIXTURES/largest.json"
+python3 - "$FIXTURES/largest.json" <<'PYEOF'
+import json, sys
+
+blobs = json.load(open(sys.argv[1]))["blobs"]
+by_path = {b["path"]: b for b in blobs}
+sql = by_path.get("database/prod.sql")
+if sql is None or sql.get("lfs_candidate") is not True:
+    print(f"FAIL: prod.sql lfs_candidate: {sql}", file=sys.stderr)
+    sys.exit(1)
+readme = by_path.get("README.md")
+if readme is None or readme.get("lfs_candidate") is not False:
+    print(f"FAIL: README.md lfs_candidate: {readme}", file=sys.stderr)
+    sys.exit(1)
+print("ok: largest --json lfs_candidate (prod.sql true, README.md false)")
+PYEOF
+"$GW" largest | grep -q "Git LFS candidate" \
+    || fail "largest human output missing LFS hint"
+echo "ok: largest human output hints at LFS candidates"
+
 # --- fixture: delta-heavy repo ------------------------------------------------
 REPO="$FIXTURES/delta"
 mkdir -p "$REPO"
@@ -438,6 +460,67 @@ import json, sys
 d = json.load(sys.stdin)
 assert d['logical_bytes'] == 3000000, d
 print('ok: explain by abbreviated oid')"
+
+# --- explain remediation playbook ------------------------------------------------
+cd "$FIXTURES/packed"
+
+# Historical blob: history-rewrite verdict with exact filter-repo/BFG commands.
+"$GW" explain database/prod.sql --json > "$FIXTURES/explain_remediation.json"
+python3 - "$FIXTURES/explain_remediation.json" <<'PYEOF'
+import json, sys
+
+r = json.load(open(sys.argv[1]))["remediation"]
+check = lambda cond, msg: (print(f"FAIL: {msg}: {r}", file=sys.stderr), sys.exit(1)) if not cond else None
+check(r["verdict"] == "history_rewrite", "verdict")
+check(set(r) == {"verdict", "commands", "caveat", "lfs"}, "remediation keys")
+cmds = {c["tool"]: c["command"] for c in r["commands"]}
+check("git-filter-repo" in cmds, "filter-repo command present")
+check("--invert-paths --path 'database/prod.sql'" in cmds["git-filter-repo"], "filter-repo args")
+check(cmds.get("BFG Repo-Cleaner") == "bfg --delete-files prod.sql", "bfg command")
+check(r["caveat"] is not None and "rewrites history" in r["caveat"].lower(), "caveat")
+check("lfs" in r, "lfs field present")
+print("ok: explain remediation for historical blob (json)")
+PYEOF
+"$GW" explain database/prod.sql | grep -q "git filter-repo --invert-paths --path 'database/prod.sql'" \
+    || fail "explain human output missing filter-repo command"
+"$GW" explain database/prod.sql | grep -q "bfg --delete-files prod.sql" \
+    || fail "explain human output missing bfg command"
+"$GW" explain database/prod.sql | grep -qi "rewrites history" \
+    || fail "explain human output missing rewrite caveat"
+echo "ok: explain remediation human output (historical)"
+
+# Unreachable blob: gc verdict with reflog expire + aggressive gc.
+DANGLING=$(cat "$FIXTURES/dangling_oid")
+"$GW" explain "$DANGLING" --json > "$FIXTURES/explain_gc.json"
+python3 - "$FIXTURES/explain_gc.json" <<'PYEOF'
+import json, sys
+
+r = json.load(open(sys.argv[1]))["remediation"]
+check = lambda cond, msg: (print(f"FAIL: {msg}: {r}", file=sys.stderr), sys.exit(1)) if not cond else None
+check(r["verdict"] == "gc", "verdict")
+check(len(r["commands"]) == 1, "one command")
+check("git reflog expire --expire=now --all && git gc --prune=now --aggressive"
+      == r["commands"][0]["command"], "gc command")
+check(r["caveat"] is None, "no caveat for gc")
+check(r["lfs"] is None, "no lfs for unreachable")
+print("ok: explain remediation for unreachable blob (json)")
+PYEOF
+"$GW" explain "$DANGLING" | grep -q "git gc --prune=now --aggressive" \
+    || fail "explain human output missing gc command"
+echo "ok: explain remediation human output (unreachable)"
+
+# Current blob with a known-binary extension: LFS migration suggestion.
+"$GW" explain assets/demo.mov --json | python3 -c "
+import json, sys
+r = json.load(sys.stdin)['remediation']
+assert r['verdict'] == 'none', r
+assert r['lfs'] is not None, r
+assert r['lfs']['pattern'] == '*.mov', r
+assert r['lfs']['command'] == \"git lfs migrate import --include='*.mov' --everything\", r
+print('ok: explain lfs recommendation for current blob (json)')"
+"$GW" explain assets/demo.mov | grep -qF "git lfs migrate import --include='*.mov' --everything" \
+    || fail "explain human output missing lfs migrate suggestion"
+echo "ok: explain lfs recommendation human output (current)"
 
 # --- summary completion ----------------------------------------------------------
 "$GW" --json | python3 -c "

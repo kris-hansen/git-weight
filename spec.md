@@ -270,6 +270,16 @@ It should answer:
 
 **“Why is this still here?”**
 
+It also answers **“What do I do about it?”**: the report ends with a
+remediation section of exact, copy-pasteable commands chosen by the verdict —
+`git reflog expire --expire=now --all && git gc --prune=now --aggressive` for
+unreachable objects, `git filter-repo`/`bfg` one-liners (with the
+history-rewrite caveat) for objects retained only by history, and a
+commit-then-rewrite note plus the Git LFS suggestion for candidates still
+present at HEAD. `--json` exposes the same as a structured `remediation`
+object. The tool never suggests a mutating command for anything it has not
+verified.
+
 ---
 
 ## 6.4 `git-weight refs`
@@ -1296,9 +1306,16 @@ Example:
 
 ---
 
-## LFS recommendations
+## LFS recommendations (implemented)
 
 Identify files that are strong Git LFS candidates.
+
+Implemented: `explain` flags a Git LFS candidate among blobs still present at
+HEAD and suggests `git lfs migrate import --include=<pattern> --everything`
+(with the history-rewrite caveat), and `largest --json` marks every blob with
+`lfs_candidate`. A blob is a candidate when its logical size is at least 5 MiB
+or its extension is a known-binary type (images, archives, media, compiled
+artifacts, database dumps, and similar).
 
 Example:
 
