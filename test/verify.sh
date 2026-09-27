@@ -16,7 +16,9 @@ case "$GW" in
 esac
 [ -x "$GW" ] || { echo "git-weight binary not found: $GW" >&2; exit 1; }
 FIXTURES="$(mktemp -d)"
-trap 'rm -rf "$FIXTURES"' EXIT
+# cd out first: removing a directory tree that contains the shell's own
+# working directory fails with EPERM on some platforms (macOS runners).
+trap 'cd /; rm -rf "$FIXTURES"' EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -1043,6 +1045,9 @@ for i in 1 2 3 4 5; do
 done
 PACK_N=$(ls .git/objects/pack/*.pack | wc -l | tr -d ' ')
 [ "$PACK_N" -ge 4 ] || fail "multipack fixture has $PACK_N packs"
+# Diagnostic: the pack directory listing, for forensics when platform git
+# versions lay out packs differently than this script expects.
+ls -la .git/objects/pack/ || true
 "$GW" packs --json > "$FIXTURES/multipack.json"
 python3 - "$FIXTURES/multipack.json" "$PACK_N" <<'PYEOF'
 import json, sys
@@ -1060,7 +1065,12 @@ if s["smallest_pack"]["bytes"] > s["largest_pack"]["bytes"]:
     sys.exit(1)
 print(f"ok: fragmentation summary ({s['pack_count']} packs, repack hint)")
 PYEOF
-"$GW" packs | grep -q "hint: " || fail "packs human output missing repack hint"
+PACKS_HUMAN=$("$GW" packs) || fail "packs command exited non-zero"
+if ! printf '%s\n' "$PACKS_HUMAN" | grep -q "hint: "; then
+    printf '%s\n' "$PACKS_HUMAN"
+    ls -la .git/objects/pack/ || true
+    fail "packs human output missing repack hint"
+fi
 echo "ok: packs human repack hint"
 
 echo "ALL INTEGRATION CHECKS PASSED"

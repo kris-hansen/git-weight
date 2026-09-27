@@ -169,7 +169,13 @@ pub const ObjectStore = struct {
 
             var mapped_index = mmap.MappedFile.init(idx_path) catch return error.CorruptRepository;
             errdefer mapped_index.deinit();
-            var mapped_pack = mmap.MappedFile.init(pack_path) catch return error.CorruptRepository;
+            // An orphaned .idx without its .pack (left behind by an
+            // interrupted repack) is ignored, matching git's own tolerance;
+            // a present-but-unreadable pack is still corruption.
+            var mapped_pack = mmap.MappedFile.init(pack_path) catch |err| switch (err) {
+                error.OpenFailed => continue,
+                else => return error.CorruptRepository,
+            };
             errdefer mapped_pack.deinit();
 
             const idx = index_mod.PackIndex.init(mapped_index.data, self.algorithm) catch |err| switch (err) {
