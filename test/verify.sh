@@ -1029,7 +1029,10 @@ PYEOF
 "$GW" packs | grep -q "Pack fragmentation" || fail "packs human output missing fragmentation section"
 echo "ok: packs human output (delta + fragmentation sections)"
 
-# Fragmentation: many small packs trigger the repack hint.
+# Fragmentation: many small packs trigger the repack hint. Packs are built
+# with one `git pack-objects` call per blob: modern `git repack` consolidates
+# incremental packs on its own schedule (observed mid-test on git 2.55 CI),
+# which would make this fixture's layout nondeterministic.
 REPO="$FIXTURES/multipack"
 mkdir -p "$REPO"
 cd "$REPO"
@@ -1038,10 +1041,12 @@ git config user.email test@example.com
 git config user.name Test
 for i in 1 2 3 4 5; do
     head -c 200000 /dev/urandom > "blob$i.bin"
-    git add -A
-    git commit -qm "c$i"
-    git repack -q
-    rm -f blob*.bin
+done
+git add -A
+git commit -qm "blobs"
+for i in 1 2 3 4 5; do
+    oid=$(git rev-parse "HEAD:blob$i.bin")
+    echo "$oid" | git pack-objects -q .git/objects/pack/pack > /dev/null
 done
 PACK_N=$(ls .git/objects/pack/*.pack | wc -l | tr -d ' ')
 [ "$PACK_N" -ge 4 ] || fail "multipack fixture has $PACK_N packs"
