@@ -11,6 +11,7 @@ pub const Command = enum {
     refs,
     @"unreachable",
     changed,
+    check,
 };
 
 pub const ParseError = error{
@@ -32,6 +33,14 @@ pub const Options = struct {
     to_ref: ?[]const u8 = null,
     /// For `changed`: exit 1 when changed, 0 when unchanged.
     exit_code: bool = false,
+    /// For `check`: maximum total .git size in bytes.
+    max_size: ?u64 = null,
+    /// For `check`: maximum historical (deleted-at-HEAD) bytes.
+    max_historical: ?u64 = null,
+    /// For `check`: maximum physical bytes reclaimable via gc.
+    max_unreachable: ?u64 = null,
+    /// For `check`: maximum largest single blob size in bytes.
+    max_blob: ?u64 = null,
     json: bool = false,
     limit: usize = 20,
     min_size: u64 = 0,
@@ -49,7 +58,7 @@ pub const usage_text =
     \\git-weight — find out what's weighing down your Git repository.
     \\
     \\Usage:
-    \\  git weight [COMMAND] [PATH] [OPTIONS]
+    \\  git-weight [COMMAND] [PATH] [OPTIONS]
     \\
     \\Commands:
     \\  summary      High-level repository report (default)
@@ -60,6 +69,7 @@ pub const usage_text =
     \\  refs         Refs retaining historical weight
     \\  unreachable  Unreachable objects reclaimable via git gc
     \\  changed      Whether a path changed between two revisions (CI)
+    \\  check        Threshold checks for CI gating (see --max-* options)
     \\
     \\Options:
     \\  --json             Machine-readable JSON output
@@ -68,6 +78,10 @@ pub const usage_text =
     \\  --to REF           Target revision for 'changed' (default HEAD)
     \\  --exit-code        For 'changed': exit 1 when changed, 0 when unchanged
     \\  --min-size SIZE    Only include blobs at least SIZE (e.g. 10MB, 500KiB)
+    \\  --max-size SIZE    For 'check': fail if total .git size exceeds SIZE
+    \\  --max-historical SIZE  For 'check': fail if historical deleted bytes exceed SIZE
+    \\  --max-unreachable SIZE For 'check': fail if gc-reclaimable bytes exceed SIZE
+    \\  --max-blob SIZE    For 'check': fail if the largest blob exceeds SIZE
     \\  --threads N        Worker thread count (default: detected CPU count)
     \\  --current          Only blobs present in the tree at HEAD
     \\  --historical       Only blobs not present in the tree at HEAD
@@ -79,7 +93,8 @@ pub const usage_text =
     \\  --help             Print this help and exit
     \\
     \\Exit codes: 0 success, 1 general error, 2 invalid arguments,
-    \\  3 repository not found, 4 unsupported Git format, 5 corrupt repository
+    \\  3 repository not found, 4 unsupported Git format, 5 corrupt repository,
+    \\  6 threshold exceeded ('check')
     \\
 ;
 
@@ -162,6 +177,22 @@ pub fn parse(argv: []const []const u8) ParseError!Options {
                 i += 1;
                 if (i >= argv.len) return error.InvalidArguments;
                 opts.min_size = parseSize(argv[i]) orelse return error.InvalidArguments;
+            } else if (std.mem.eql(u8, arg, "--max-size")) {
+                i += 1;
+                if (i >= argv.len) return error.InvalidArguments;
+                opts.max_size = parseSize(argv[i]) orelse return error.InvalidArguments;
+            } else if (std.mem.eql(u8, arg, "--max-historical")) {
+                i += 1;
+                if (i >= argv.len) return error.InvalidArguments;
+                opts.max_historical = parseSize(argv[i]) orelse return error.InvalidArguments;
+            } else if (std.mem.eql(u8, arg, "--max-unreachable")) {
+                i += 1;
+                if (i >= argv.len) return error.InvalidArguments;
+                opts.max_unreachable = parseSize(argv[i]) orelse return error.InvalidArguments;
+            } else if (std.mem.eql(u8, arg, "--max-blob")) {
+                i += 1;
+                if (i >= argv.len) return error.InvalidArguments;
+                opts.max_blob = parseSize(argv[i]) orelse return error.InvalidArguments;
             } else if (std.mem.eql(u8, arg, "--threads")) {
                 i += 1;
                 if (i >= argv.len) return error.InvalidArguments;
@@ -204,6 +235,10 @@ pub fn parse(argv: []const []const u8) ParseError!Options {
 
     if (opts.command == .explain and opts.explain_target == null) return error.InvalidArguments;
     if (opts.command == .changed and opts.changed_path == null) return error.InvalidArguments;
+    if (opts.command == .check and
+        opts.max_size == null and opts.max_historical == null and
+        opts.max_unreachable == null and opts.max_blob == null)
+        return error.InvalidArguments;
     if (opts.current_only and opts.historical_only) return error.InvalidArguments;
     return opts;
 }
@@ -264,4 +299,22 @@ test "parse args" {
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "--nope" }));
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "largest", "a", "b" }));
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "--current", "--historical" }));
+
+    const a7 = try parse(&.{ "check", "--max-size", "1GB" });
+    try std.testing.expectEqual(Command.check, a7.command);
+    try std.testing.expectEqual(@as(?u64, 1024 * 1024 * 1024), a7.max_size);
+    try std.testing.expect(a7.max_historical == null and a7.max_unreachable == null and a7.max_blob == null);
+
+    const a8 = try parse(&.{
+        "check",           "--max-size", "100MB", "--max-historical", "10MB",
+        "--max-unreachable", "5MB",     "--max-blob", "1MB",
+    });
+    try std.testing.expectEqual(@as(?u64, 100 * 1024 * 1024), a8.max_size);
+    try std.testing.expectEqual(@as(?u64, 10 * 1024 * 1024), a8.max_historical);
+    try std.testing.expectEqual(@as(?u64, 5 * 1024 * 1024), a8.max_unreachable);
+    try std.testing.expectEqual(@as(?u64, 1024 * 1024), a8.max_blob);
+
+    try std.testing.expectError(error.InvalidArguments, parse(&.{"check"}));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "check", "--max-size", "bogus" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "check", "--max-blob" }));
 }

@@ -87,7 +87,7 @@ pub fn treeEntryAtPath(
     return null;
 }
 
-/// Compare `path` between two commits (spec: `git weight changed`).
+/// Compare `path` between two commits (spec: `git-weight changed`).
 pub fn compare(
     store: *const object_store.ObjectStore,
     path: []const u8,

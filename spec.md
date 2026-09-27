@@ -31,7 +31,7 @@ git-weight
 Git can invoke it naturally as:
 
 ```bash
-git weight
+git-weight
 ```
 
 when `git-weight` is available on `$PATH`.
@@ -104,7 +104,7 @@ Initial releases will not:
 The preferred invocation is:
 
 ```bash
-git weight
+git-weight
 ```
 
 Direct execution is equivalent:
@@ -152,41 +152,41 @@ Largest contributor:
 
 Run:
 
-  git weight explain database/prod.sql
+  git-weight explain database/prod.sql
 ```
 
 ---
 
 # 6. Core Commands
 
-## 6.1 `git weight`
+## 6.1 `git-weight`
 
 Displays the high-level repository report.
 
 ```bash
-git weight
+git-weight
 ```
 
 Equivalent to:
 
 ```bash
-git weight summary
+git-weight summary
 ```
 
 Optional repository:
 
 ```bash
-git weight /path/to/repository
+git-weight /path/to/repository
 ```
 
 ---
 
-## 6.2 `git weight largest`
+## 6.2 `git-weight largest`
 
 Lists the largest blobs in repository history.
 
 ```bash
-git weight largest
+git-weight largest
 ```
 
 Example:
@@ -201,10 +201,10 @@ SIZE       OBJECT        PATH
 Options:
 
 ```bash
-git weight largest --limit 50
-git weight largest --min-size 10MB
-git weight largest --current
-git weight largest --historical
+git-weight largest --limit 50
+git-weight largest --min-size 10MB
+git-weight largest --current
+git-weight largest --historical
 ```
 
 Default limit:
@@ -215,20 +215,20 @@ Default limit:
 
 ---
 
-## 6.3 `git weight explain`
+## 6.3 `git-weight explain`
 
 Explains why a path or object contributes to repository weight.
 
 Examples:
 
 ```bash
-git weight explain database/prod.sql
+git-weight explain database/prod.sql
 ```
 
 or:
 
 ```bash
-git weight explain 81f43dc
+git-weight explain 81f43dc
 ```
 
 Example output:
@@ -272,12 +272,12 @@ It should answer:
 
 ---
 
-## 6.4 `git weight refs`
+## 6.4 `git-weight refs`
 
 Shows refs responsible for retaining historical weight.
 
 ```bash
-git weight refs
+git-weight refs
 ```
 
 Example:
@@ -296,12 +296,12 @@ Because exact attribution can be expensive, this command may provide either exac
 
 ---
 
-## 6.5 `git weight objects`
+## 6.5 `git-weight objects`
 
 Displays low-level object statistics.
 
 ```bash
-git weight objects
+git-weight objects
 ```
 
 Example:
@@ -316,12 +316,12 @@ tag              184    312 KB
 
 ---
 
-## 6.6 `git weight packs`
+## 6.6 `git-weight packs`
 
 Displays packfile statistics.
 
 ```bash
-git weight packs
+git-weight packs
 ```
 
 Example:
@@ -343,12 +343,12 @@ Future versions may additionally report:
 
 ---
 
-## 6.7 `git weight unreachable`
+## 6.7 `git-weight unreachable`
 
 Displays unreachable objects.
 
 ```bash
-git weight unreachable
+git-weight unreachable
 ```
 
 Example:
@@ -368,6 +368,39 @@ This command should clearly distinguish between:
 
 - storage reclaimable via normal Git GC
 - storage requiring history rewriting
+
+---
+
+## 6.8 `git-weight check`
+
+Threshold checks for CI gating (implemented).
+
+```bash
+git-weight check --max-size 500MB --max-blob 20MB
+```
+
+At least one threshold is required; each `--max-*` option takes a size (e.g. `10MB`, `500KiB`):
+
+- `--max-size SIZE` — total `.git` size
+- `--max-historical SIZE` — bytes of historical (deleted-at-HEAD) content
+- `--max-unreachable SIZE` — physical bytes reclaimable via `git gc`
+- `--max-blob SIZE` — largest single blob by logical size
+
+Example:
+
+```text
+Thresholds
+
+  CHECK              LIMIT        ACTUAL       RESULT
+  max-size           500 MB       206 KB       ok
+  max-blob           20.0 MB      22.2 MB      FAIL
+
+Verdict: FAIL
+```
+
+The analysis reuses the summary pass, so `check` costs about the same as one `summary` run. Exit code 6 means a threshold was exceeded; 0 means all configured thresholds passed. With `--json`, output is `{"repository": {...}, "thresholds": [{"name", "limit", "actual", "ok"}], "ok": ...}`.
+
+Growth-based checks (`--max-growth`) remain future work (see §36).
 
 ---
 
@@ -452,7 +485,7 @@ Input should be case-insensitive.
 Every diagnostic command should support:
 
 ```bash
-git weight --json
+git-weight --json
 ```
 
 Example:
@@ -673,7 +706,7 @@ The same object may appear:
 For:
 
 ```bash
-git weight largest
+git-weight largest
 ```
 
 a representative path is sufficient.
@@ -681,7 +714,7 @@ a representative path is sufficient.
 For:
 
 ```bash
-git weight explain
+git-weight explain
 ```
 
 the tool should perform deeper historical analysis.
@@ -830,7 +863,7 @@ threads = detected CPU count
 Override:
 
 ```bash
-git weight --threads 8
+git-weight --threads 8
 ```
 
 The implementation should not create a task or allocation for every Git object.
@@ -989,10 +1022,10 @@ The first useful release should remain intentionally focused.
 Commands:
 
 ```bash
-git weight
-git weight largest
-git weight largest --limit 50
-git weight --json
+git-weight
+git-weight largest
+git-weight largest --limit 50
+git-weight --json
 ```
 
 ---
@@ -1006,7 +1039,7 @@ Add:
 - delta resolution
 - exact logical blob sizes
 - deeper historical path resolution
-- `git weight explain`
+- `git-weight explain`
 - Windows support
 
 ---
@@ -1018,7 +1051,7 @@ Add:
 - reachability analysis
 - unreachable object reporting
 - branch and tag retention analysis
-- `git weight refs`
+- `git-weight refs`
 - physical versus logical contribution
 - reclaimability estimates
 - performance improvements for very large repositories
@@ -1046,15 +1079,15 @@ All of this should work without requiring Git itself.
 # 31. CLI Grammar
 
 ```text
-git weight [PATH] [OPTIONS]
+git-weight [PATH] [OPTIONS]
 
-git weight summary [PATH]
-git weight largest [PATH]
-git weight explain <PATH|OBJECT>
-git weight objects [PATH]
-git weight packs [PATH]
-git weight refs [PATH]
-git weight unreachable [PATH]
+git-weight summary [PATH]
+git-weight largest [PATH]
+git-weight explain <PATH|OBJECT>
+git-weight objects [PATH]
+git-weight packs [PATH]
+git-weight refs [PATH]
+git-weight unreachable [PATH]
 ```
 
 Common options:
@@ -1082,6 +1115,7 @@ Suggested:
 3    repository not found
 4    unsupported Git format
 5    corrupt repository
+6    threshold exceeded ('check')
 ```
 
 Automation should be able to depend on these values.
@@ -1171,7 +1205,7 @@ git-weight
 This enables:
 
 ```bash
-git weight
+git-weight
 ```
 
 ## Homebrew
@@ -1205,7 +1239,7 @@ The binary should have no runtime dependency beyond normal OS facilities.
 ## Repository growth
 
 ```bash
-git weight growth
+git-weight growth
 ```
 
 Example:
@@ -1223,7 +1257,7 @@ Example:
 ## Commit contribution
 
 ```bash
-git weight commits
+git-weight commits
 ```
 
 Identify commits responsible for the largest increases in repository weight.
@@ -1232,8 +1266,12 @@ Identify commits responsible for the largest increases in repository weight.
 
 ## CI regression detection
 
+Implemented as `git-weight check` (see §6.8): threshold checks on current repository data (`--max-size`, `--max-historical`, `--max-unreachable`, `--max-blob`), exiting 6 when a threshold is exceeded.
+
+Growth-based checks remain future work:
+
 ```bash
-git weight check --max-growth 10MB
+git-weight check --max-growth 10MB
 ```
 
 Fail CI if a pull request introduces excessive repository growth.
@@ -1243,7 +1281,7 @@ Fail CI if a pull request introduces excessive repository growth.
 ## File-type analysis
 
 ```bash
-git weight types
+git-weight types
 ```
 
 Example:
@@ -1322,7 +1360,7 @@ That explanation is the product.
 The first engineering milestone should be:
 
 ```bash
-git weight largest
+git-weight largest
 ```
 
 against a real packed repository.
@@ -1360,7 +1398,7 @@ git-weight
 Primary CLI:
 
 ```bash
-git weight
+git-weight
 ```
 
 Suggested tagline:

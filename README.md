@@ -12,27 +12,27 @@ Install with Homebrew on macOS 14+ or Linux (Intel and ARM64):
 
 ```sh
 brew install kris-hansen/git-weight/git-weight
-git weight --version
+git-weight --version
 ```
 
 Go to a Git repository and find what's taking up space:
 
 ```sh
 cd /path/to/your/repository
-git weight                       # overall storage report
-git weight largest --limit 10    # largest files in repository history
-git weight largest --historical  # files no longer present at HEAD
+git-weight                       # overall storage report
+git-weight largest --limit 10    # largest files in repository history
+git-weight largest --historical  # files no longer present at HEAD
 ```
 
 To investigate a file from the report, replace `path/to/large-file` below with
 its path. You can also export the summary as JSON:
 
 ```sh
-git weight explain path/to/large-file
-git weight --json > weight-report.json
+git-weight explain path/to/large-file
+git-weight --json > weight-report.json
 ```
 
-`git weight` and `git-weight` are equivalent. All analysis is read-only.
+All analysis is read-only.
 
 Update to the latest release with:
 
@@ -51,12 +51,12 @@ zig build -Doptimize=ReleaseFast
 ./zig-out/bin/git-weight --version
 ```
 
-Put the resulting `zig-out/bin/git-weight` binary on your `$PATH` to use `git weight`.
+Put the resulting `zig-out/bin/git-weight` binary on your `$PATH` to use `git-weight`.
 
 ## Usage
 
 ```text
-git weight [COMMAND] [PATH] [OPTIONS]
+git-weight [COMMAND] [PATH] [OPTIONS]
 
 Commands:
   summary      High-level repository report (default)
@@ -67,6 +67,7 @@ Commands:
   refs         Refs retaining historical weight
   unreachable  Unreachable objects reclaimable via git gc
   changed      Whether a path changed between two revisions (CI)
+  check        Threshold checks for CI gating (see --max-* options)
 
 Options:
   --json             Machine-readable JSON output
@@ -76,6 +77,10 @@ Options:
   --base REF         Base revision for 'changed' (default HEAD~1)
   --to REF           Target revision for 'changed' (default HEAD)
   --exit-code        For 'changed': exit 1 when changed, 0 when unchanged
+  --max-size SIZE    For 'check': fail if total .git size exceeds SIZE
+  --max-historical SIZE  For 'check': fail if historical deleted bytes exceed SIZE
+  --max-unreachable SIZE For 'check': fail if gc-reclaimable bytes exceed SIZE
+  --max-blob SIZE    For 'check': fail if the largest blob exceeds SIZE
   --current          Only blobs present in the tree at HEAD
   --historical       Only blobs not present in the tree at HEAD
   --no-color         Disable colored output
@@ -89,7 +94,7 @@ Options:
 Example:
 
 ```text
-$ git weight
+$ git-weight
 
 Repository: my-project
 
@@ -125,16 +130,16 @@ Largest contributor:
 
 Run:
 
-  git weight explain database/prod.sql
+  git-weight explain database/prod.sql
 ```
 
 ### Change detection for CI
 
-`git weight changed` compares the tree (or blob) hash of a path between two revisions — a native, `git`-free `git diff --quiet` for automation:
+`git-weight changed` compares the tree (or blob) hash of a path between two revisions — a native, `git`-free `git diff --quiet` for automation:
 
 ```sh
 # Rebuild services/api only if it changed since the base branch.
-if git weight changed services/api --base origin/main --exit-code; then
+if git-weight changed services/api --base origin/main --exit-code; then
     echo "no changes under services/api"
 else
     echo "services/api changed — running build"
@@ -142,6 +147,21 @@ fi
 ```
 
 `--base` defaults to `HEAD~1` and `--to` to `HEAD`; both accept ref names, full hex oids, and ancestry suffixes (`~N`, `^N`, e.g. `HEAD~2^1`). Annotated tags are peeled to their commits. With `--json`, each side is reported as `{"ref": ..., "commit": ..., "tree": ...}`, where `tree` holds the subtree or blob oid at the path (null when the path is absent on that side).
+
+### CI gating
+
+`git-weight check` fails the build when repository storage crosses configured thresholds. It runs the same analysis as `summary` and evaluates one or more `--max-*` limits, exiting 0 when all pass and 6 when any threshold is exceeded:
+
+```sh
+# Fail CI if the repository is getting too heavy.
+git-weight check \
+    --max-size 500MB \
+    --max-historical 100MB \
+    --max-unreachable 50MB \
+    --max-blob 20MB
+```
+
+Each threshold compares against a value from the summary report: `--max-size` against the total `.git` size, `--max-historical` against bytes of deleted-at-HEAD content, `--max-unreachable` against physical bytes reclaimable via `git gc`, and `--max-blob` against the largest single blob. At least one threshold is required. With `--json`, results are reported as `{"repository": {...}, "thresholds": [{"name", "limit", "actual", "ok"}], "ok": ...}` for machine-readable CI logs.
 
 ### Terminology
 
@@ -163,6 +183,7 @@ fi
 | 3    | repository not found  |
 | 4    | unsupported Git format|
 | 5    | corrupt repository    |
+| 6    | threshold exceeded (`check`) |
 
 ## Performance
 

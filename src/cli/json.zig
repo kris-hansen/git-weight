@@ -7,6 +7,7 @@ const reachability = @import("../analysis/reachability.zig");
 const refs_analysis = @import("../analysis/refs.zig");
 const explain_mod = @import("../analysis/explain.zig");
 const changed_mod = @import("../analysis/changed.zig");
+const check_mod = @import("../analysis/check.zig");
 const object_id_mod = @import("../git/object_id.zig");
 
 pub const WriteError = std.Io.Writer.Error;
@@ -161,6 +162,41 @@ pub fn printSummary(jw: *JsonWriter, s: *const summary_mod.Summary) WriteError!v
 
     try jw.field("unreachable_bytes");
     try jw.writeU64(s.unreachable_bytes);
+
+    try jw.endObject();
+    try jw.w.writeByte('\n');
+}
+
+pub fn printCheck(jw: *JsonWriter, s: *const summary_mod.Summary, check: *const check_mod.Check) WriteError!void {
+    try jw.beginObject();
+
+    try jw.field("repository");
+    try jw.beginObject();
+    try jw.field("path");
+    try jw.writeOptPath(s.worktree_path);
+    try jw.field("git_dir");
+    try jw.writeString(s.git_dir_path);
+    try jw.endObject();
+
+    try jw.field("thresholds");
+    try jw.beginArray();
+    for (check.thresholds) |t| {
+        try jw.beforeField();
+        try jw.beginObject();
+        try jw.field("name");
+        try jw.writeString(t.name);
+        try jw.field("limit");
+        try jw.writeU64(t.limit);
+        try jw.field("actual");
+        try jw.writeU64(t.actual);
+        try jw.field("ok");
+        try writeBool(jw, t.ok());
+        try jw.endObject();
+    }
+    try jw.endArray();
+
+    try jw.field("ok");
+    try writeBool(jw, check.allOk());
 
     try jw.endObject();
     try jw.w.writeByte('\n');

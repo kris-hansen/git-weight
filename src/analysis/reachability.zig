@@ -1,7 +1,6 @@
 const std = @import("std");
 const object_id = @import("../git/object_id.zig");
 const object_store = @import("objects.zig");
-const refs_mod = @import("../git/refs.zig");
 const commit_mod = @import("../git/commit.zig");
 const tree_mod = @import("../git/tree.zig");
 const tag_mod = @import("../git/tag.zig");
@@ -76,17 +75,17 @@ pub fn computeFromTips(
     return result;
 }
 
-/// Reachability from every ref (including HEAD). Annotated tags are walked
-/// naturally since tag objects reference their target.
-pub fn computeAll(
-    store: *const object_store.ObjectStore,
-    refs: *const refs_mod.Refs,
+/// Copy a raw set of reachable oids (e.g. PathMap.reachable) into a
+/// Reachable that callers can extend with additional walks.
+pub fn copyReachable(
     allocator: std.mem.Allocator,
+    src: *const std.HashMapUnmanaged(object_id.ObjectId, void, object_id.ObjectId.Context, 80),
 ) ReachError!Reachable {
-    var tips: std.ArrayList(object_id.ObjectId) = .empty;
-    defer tips.deinit(allocator);
-    for (refs.refs.items) |r| try tips.append(allocator, r.target);
-    return computeFromTips(store, tips.items, allocator);
+    var result: Reachable = .{ .allocator = allocator, .set = .empty };
+    errdefer result.deinit();
+    var it = src.keyIterator();
+    while (it.next()) |k| try result.set.put(allocator, k.*, {});
+    return result;
 }
 
 pub const UnreachableStats = struct {

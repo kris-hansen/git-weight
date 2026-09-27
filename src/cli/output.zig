@@ -7,6 +7,7 @@ const reachability = @import("../analysis/reachability.zig");
 const refs_analysis = @import("../analysis/refs.zig");
 const explain_mod = @import("../analysis/explain.zig");
 const changed_mod = @import("../analysis/changed.zig");
+const check_mod = @import("../analysis/check.zig");
 const object_id = @import("../git/object_id.zig");
 
 pub const WriteError = std.Io.Writer.Error;
@@ -88,10 +89,31 @@ pub fn printSummary(w: *std.Io.Writer, s: *const summary_mod.Summary) WriteError
             try w.writeAll("\nLargest contributor:\n");
             try w.print("  {s}\n\n", .{p});
             try w.writeAll("Run:\n\n");
-            try w.print("  git weight explain {s}\n", .{p});
+            try w.print("  git-weight explain {s}\n", .{p});
             break;
         }
     }
+}
+
+pub fn printCheck(w: *std.Io.Writer, check: *const check_mod.Check) WriteError!void {
+    try w.writeAll("Thresholds\n\n");
+    try w.writeAll("  CHECK              LIMIT        ACTUAL       RESULT\n");
+    var hbuf: [64]u8 = undefined;
+    for (check.thresholds) |t| {
+        try w.print("  {s}", .{t.name});
+        var pad: usize = if (t.name.len < 19) 19 - t.name.len else 1;
+        while (pad > 0) : (pad -= 1) try w.writeByte(' ');
+        const limit_str = formatSize(&hbuf, t.limit);
+        try w.print("{s}", .{limit_str});
+        pad = if (limit_str.len < 13) 13 - limit_str.len else 1;
+        while (pad > 0) : (pad -= 1) try w.writeByte(' ');
+        const actual_str = formatSize(&hbuf, t.actual);
+        try w.print("{s}", .{actual_str});
+        pad = if (actual_str.len < 13) 13 - actual_str.len else 1;
+        while (pad > 0) : (pad -= 1) try w.writeByte(' ');
+        try w.print("{s}\n", .{if (t.ok()) "ok" else "FAIL"});
+    }
+    try w.print("\nVerdict: {s}\n", .{if (check.allOk()) "ok" else "FAIL"});
 }
 
 pub fn printLargest(w: *std.Io.Writer, entries: []const largest_mod.BlobEntry) WriteError!void {

@@ -446,7 +446,7 @@ d = json.load(sys.stdin)
 assert 'unreachable_bytes' in d, d.keys()
 print('ok: summary json has unreachable_bytes')"
 "$GW" | grep -q "Largest contributor:" || fail "summary missing Largest contributor"
-"$GW" | grep -q "git weight explain" || fail "summary missing explain hint"
+"$GW" | grep -q "git-weight explain" || fail "summary missing explain hint"
 echo "ok: summary shows largest contributor hint"
 
 # --- explain error cases ----------------------------------------------------------
@@ -573,5 +573,69 @@ CODE=$?
 set -e
 [ "$CODE" -eq 2 ] || fail "expected exit 2 for changed without path, got $CODE"
 echo "ok: changed error exit codes (1 missing path, 2 bad ref, 2 no path)"
+
+# --- check: CI threshold gating ---------------------------------------------------
+cd "$FIXTURES/packed"
+
+# (a) generous limits pass with exit 0.
+set +e
+"$GW" check --max-size 1GB --max-historical 10MB --max-unreachable 10MB --max-blob 10MB >/dev/null 2>&1
+CODE=$?
+set -e
+[ "$CODE" -eq 0 ] || fail "expected exit 0 for generous limits, got $CODE"
+echo "ok: check passes with generous limits (exit 0)"
+
+# (b) tiny limits fail with exit 6.
+set +e
+"$GW" check --max-size 1KB >/dev/null 2>&1
+CODE=$?
+set -e
+[ "$CODE" -eq 6 ] || fail "expected exit 6 for exceeded threshold, got $CODE"
+echo "ok: check fails with tiny limits (exit 6)"
+
+# (c) human output lists thresholds and the verdict.
+"$GW" check --max-size 1KB 2>/dev/null | grep -q "max-size" || fail "check human output missing threshold row"
+"$GW" check --max-size 1KB 2>/dev/null | grep -q "Verdict: FAIL" || fail "check human output missing FAIL verdict"
+"$GW" check --max-blob 10MB 2>/dev/null | grep -q "Verdict: ok" || fail "check human output missing ok verdict"
+echo "ok: check human output (thresholds + verdict)"
+
+# (d) JSON shape, with actuals cross-checked against the oracle. A failing
+# check exits 6 in JSON mode too.
+set +e
+"$GW" check --max-size 1GB --max-blob 1KB --json > "$FIXTURES/check.json"
+CODE=$?
+set -e
+[ "$CODE" -eq 6 ] || fail "expected exit 6 for failing check --json, got $CODE"
+python3 - "$FIXTURES/check.json" <<'PYEOF'
+import json, subprocess, sys
+
+d = json.load(open(sys.argv[1]))
+check = lambda cond, msg: (print(f"FAIL: {msg}: {d}", file=sys.stderr), sys.exit(1)) if not cond else None
+check("repository" in d and "git_dir" in d["repository"], "repository identity")
+ts = {t["name"]: t for t in d["thresholds"]}
+check(set(ts) == {"max-size", "max-blob"}, "threshold names")
+for t in ts.values():
+    check(set(t) == {"name", "limit", "actual", "ok"}, "threshold keys")
+    check(t["ok"] == (t["actual"] <= t["limit"]), "ok semantics")
+check(ts["max-size"]["ok"] is True, "max-size should pass at 1GB")
+# Largest blob oracle: the 3 MB database/prod.sql from the fixture.
+check(ts["max-blob"]["actual"] == 3000000, "max-blob actual")
+check(ts["max-blob"]["ok"] is False, "max-blob should fail at 1KB")
+check(d["ok"] is False, "overall ok")
+print("ok: check --json shape and values")
+PYEOF
+
+# (e) missing thresholds are invalid arguments.
+set +e
+"$GW" check >/dev/null 2>&1
+CODE=$?
+set -e
+[ "$CODE" -eq 2 ] || fail "expected exit 2 for check without thresholds, got $CODE"
+set +e
+"$GW" check --max-size >/dev/null 2>&1
+CODE=$?
+set -e
+[ "$CODE" -eq 2 ] || fail "expected exit 2 for --max-size without value, got $CODE"
+echo "ok: check error exit codes (2 no thresholds, 2 missing value)"
 
 echo "ALL INTEGRATION CHECKS PASSED"

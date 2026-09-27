@@ -1,7 +1,7 @@
 const std = @import("std");
-const Io = std.Io;
 const object_id = @import("../object_id.zig");
 const git_object = @import("../object.zig");
+const inflate = @import("../inflate.zig");
 const PackIndex = @import("index.zig").PackIndex;
 const delta = @import("delta.zig");
 
@@ -238,11 +238,11 @@ pub const Pack = struct {
     /// Inflate just enough of the delta stream at `data_offset` to read the
     /// source and target size varints.
     fn deltaTargetSize(self: *const Pack, data_offset: u64) PackError!u64 {
-        var in = Io.Reader.fixed(self.data[@intCast(data_offset)..]);
-        var window: [std.compress.flate.max_window_len]u8 = undefined;
-        var decomp = std.compress.flate.Decompress.init(&in, .zlib, &window);
+        var infl: inflate.Inflater = undefined;
+        infl.init(self.data[@intCast(data_offset)..]);
+        defer infl.deinit();
         var buf: [32]u8 = undefined;
-        const n = decomp.reader.readSliceShort(&buf) catch return error.CorruptPack;
+        const n = infl.read(&buf) catch return error.CorruptPack;
         var pos: usize = 0;
         _ = delta.readVarint(buf[0..n], &pos) orelse return error.CorruptPack;
         return delta.readVarint(buf[0..n], &pos) orelse return error.CorruptPack;
@@ -275,13 +275,13 @@ pub const Pack = struct {
     /// Inflate the decompressed delta instruction stream for the entry at
     /// `offset`. `stream_size` is the entry's declared (decompressed) size.
     fn inflateDeltaStream(self: *const Pack, allocator: std.mem.Allocator, data_offset: u64, stream_size: u64) PackError![]u8 {
-        var in = Io.Reader.fixed(self.data[@intCast(data_offset)..]);
-        var window: [std.compress.flate.max_window_len]u8 = undefined;
-        var decomp = std.compress.flate.Decompress.init(&in, .zlib, &window);
+        var infl: inflate.Inflater = undefined;
+        infl.init(self.data[@intCast(data_offset)..]);
+        defer infl.deinit();
         const buf = allocator.alloc(u8, @intCast(stream_size)) catch return error.OutOfMemory;
         errdefer allocator.free(buf);
         // Delta entries: entry size is the decompressed delta stream length.
-        decomp.reader.readSliceAll(buf) catch return error.CorruptPack;
+        infl.readAll(buf) catch return error.CorruptPack;
         return buf;
     }
 
@@ -389,12 +389,12 @@ pub const Pack = struct {
         const raw = try self.readRawEntry(offset);
         switch (raw.entry_type) {
             .commit, .tree, .blob, .tag => {
-                var in = Io.Reader.fixed(self.data[@intCast(raw.data_offset)..]);
-                var window: [std.compress.flate.max_window_len]u8 = undefined;
-                var decomp = std.compress.flate.Decompress.init(&in, .zlib, &window);
+                var infl: inflate.Inflater = undefined;
+                infl.init(self.data[@intCast(raw.data_offset)..]);
+                defer infl.deinit();
                 const buf = allocator.alloc(u8, @intCast(raw.size)) catch return error.OutOfMemory;
                 errdefer allocator.free(buf);
-                decomp.reader.readSliceAll(buf) catch return error.CorruptPack;
+                infl.readAll(buf) catch return error.CorruptPack;
                 if (cache) |c| c.put(offset, raw.entry_type, buf);
                 return .{ .object_type = raw.entry_type, .data = buf };
             },

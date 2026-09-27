@@ -64,7 +64,7 @@ After the first stable release:
 ```sh
 brew install kris-hansen/git-weight/git-weight
 brew test kris-hansen/git-weight/git-weight
-git weight --version
+git-weight --version
 ```
 
 Users update with `brew update && brew upgrade git-weight`.

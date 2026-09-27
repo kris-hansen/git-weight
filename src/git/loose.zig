@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 const object_id = @import("object_id.zig");
 const git_object = @import("object.zig");
+const inflate = @import("inflate.zig");
 const mmap = @import("../platform/mmap.zig");
 
 pub const LooseError = error{
@@ -39,11 +40,11 @@ fn io() Io {
 /// Decompress only the `"<type> <size>\x00"` header of a zlib-compressed Git
 /// object, without materializing the payload. `data` is the compressed bytes.
 pub fn readObjectHeader(data: []const u8) !git_object.Header {
-    var in = Io.Reader.fixed(data);
-    var window: [std.compress.flate.max_window_len]u8 = undefined;
-    var decomp = std.compress.flate.Decompress.init(&in, .zlib, &window);
+    var infl: inflate.Inflater = undefined;
+    infl.init(data);
+    defer infl.deinit();
     var buf: [64]u8 = undefined;
-    const n = decomp.reader.readSliceShort(&buf) catch return error.CorruptRepository;
+    const n = infl.read(&buf) catch return error.CorruptRepository;
     const parsed = git_object.parseHeader(buf[0..n]) catch return error.CorruptRepository;
     return parsed.header;
 }

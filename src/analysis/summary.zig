@@ -5,7 +5,6 @@ const object_store = @import("objects.zig");
 const paths_mod = @import("paths.zig");
 const largest_mod = @import("largest.zig");
 const scan_mod = @import("scan.zig");
-const reachability = @import("reachability.zig");
 const filesystem = @import("../platform/filesystem.zig");
 
 pub const SummaryError = error{
@@ -80,8 +79,7 @@ pub fn build(
     // One parallel pass for type stats, top blobs, historical weight, and
     // unreachable stats; paths.compute already visited every reachable
     // object, so its set doubles as the reachability input.
-    const reachable = reachability.Reachable{ .allocator = allocator, .set = path_map.reachable };
-    const scan_r = try scan_mod.fullScan(store, &path_map, &reachable, 4, 0, .all, allocator);
+    const scan_r = try scan_mod.fullScan(store, &path_map, .{ .map = &path_map }, 4, 0, .all, allocator);
     const stats = scan_r.stats;
     const contributors = scan_r.top;
     const historical_bytes = scan_r.historical_bytes;
