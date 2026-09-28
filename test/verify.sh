@@ -624,6 +624,57 @@ print('ok: summary json has unreachable_bytes')"
 "$GW" | grep -q "git-weight explain" || fail "summary missing explain hint"
 echo "ok: summary shows largest contributor hint"
 
+# --- bare-invocation progress heartbeat ------------------------------------------
+# Redirected stderr is not a terminal: no heartbeat, stdout matches `summary`.
+"$GW" > "$FIXTURES/bare.out" 2> "$FIXTURES/bare.err"
+"$GW" summary > "$FIXTURES/summary.out"
+[ ! -s "$FIXTURES/bare.err" ] || fail "bare run wrote to non-tty stderr: $(cat "$FIXTURES/bare.err")"
+cmp -s "$FIXTURES/bare.out" "$FIXTURES/summary.out" || fail "bare run stdout differs from summary"
+echo "ok: bare run with redirected stderr is silent and matches summary"
+
+# With stderr on a pty the heartbeat may print dots, but only as one
+# newline-terminated line on stderr; stdout and explicit invocations are
+# unaffected.
+python3 - "$GW" "$FIXTURES/summary.out" "$FIXTURES" <<'PYEOF'
+import os, pty, re, select, subprocess, sys
+
+gw, summary_path, fixtures = sys.argv[1], sys.argv[2], sys.argv[3]
+summary = open(summary_path, "rb").read()
+line = re.compile(rb"^(\.+\r?\n)?")
+
+def run(args, cwd="."):
+    master, slave = pty.openpty()
+    try:
+        p = subprocess.run([gw] + args, stdout=subprocess.PIPE, stderr=slave, cwd=cwd)
+        err = b""
+        # Keep the slave open while draining: macOS discards unread pty
+        # output once every slave descriptor is closed.
+        while select.select([master], [], [], 0.2)[0]:
+            chunk = os.read(master, 4096)
+            if not chunk:
+                break
+            err += chunk
+        return p.returncode, p.stdout, err
+    finally:
+        os.close(slave)
+        os.close(master)
+
+code, out, err = run([])
+assert code == 0, code
+assert out == summary, "bare stdout differs from summary under tty stderr"
+assert line.fullmatch(err), err
+for args in (["summary"], ["--no-color"], ["--json"], ["."]):
+    code, out, err = run(args)
+    assert code == 0, (args, code)
+    assert err == b"", (args, err)
+code, out, err = run([], cwd=os.path.join(fixtures, "notrepo"))
+assert code == 3, code
+assert out == b"", out
+m = line.match(err)
+assert err[m.end():] == b"error: not inside a Git repository\r\n", err
+print("ok: heartbeat confined to bare runs and cleanly terminated on stderr")
+PYEOF
+
 # --- explain error cases ----------------------------------------------------------
 set +e
 "$GW" explain does/not/exist >/dev/null 2>&1
