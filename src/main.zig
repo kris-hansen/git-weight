@@ -2,6 +2,7 @@ const std = @import("std");
 const args_mod = @import("cli/args.zig");
 const output = @import("cli/output.zig");
 const json = @import("cli/json.zig");
+const progress = @import("cli/progress.zig");
 const repository = @import("git/repository.zig");
 const refs_mod = @import("git/refs.zig");
 const revision = @import("git/revision.zig");
@@ -57,6 +58,7 @@ comptime {
     _ = @import("cli/args.zig");
     _ = @import("cli/output.zig");
     _ = @import("cli/json.zig");
+    _ = @import("cli/progress.zig");
     _ = @import("git/repository.zig");
     _ = @import("git/refs.zig");
     _ = @import("git/revision.zig");
@@ -124,14 +126,28 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const code = run(init.io, allocator, w, errw, &opts);
+    // Dot heartbeat for a bare `git-weight` run. It writes straight to the
+    // stderr file (not through `errw`), and `run` stops it before emitting
+    // any output, so nothing else touches stderr while it is live.
+    var hb_buffer: [16]u8 = undefined;
+    var hb_writer = std.Io.File.stderr().writerStreaming(init.io, &hb_buffer);
+    var heartbeat: progress.Heartbeat = .{ .io = init.io, .out = &hb_writer.interface };
+    defer heartbeat.finish();
+    const stderr_tty = std.Io.File.stderr().isTty(init.io) catch false;
+    const show_progress = progress.shouldShow(argv.len - 1, stderr_tty);
+    if (show_progress) heartbeat.start();
+
+    const code = run(init.io, allocator, w, errw, &opts, if (show_progress) &heartbeat else null);
     try w.flush();
     try errw.flush();
     flushed = true;
     if (code != exit_success) std.process.exit(code);
 }
 
-fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.Io.Writer, opts: *const args_mod.Options) ExitCode {
+fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.Io.Writer, opts: *const args_mod.Options, heartbeat: ?*progress.Heartbeat) ExitCode {
+    // Every return path ends the heartbeat line before main flushes output
+    // or error text.
+    defer if (heartbeat) |hb| hb.finish();
     var timer = Timer.init(io, errw, opts.verbose);
 
     const start_path = opts.repo_path orelse ".";
@@ -179,6 +195,7 @@ fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.I
                 return reportAnalysisError(errw, err);
             };
             timer.mark("analysis: summary in", .{});
+            if (heartbeat) |hb| hb.finish();
             if (opts.json) {
                 var jw: json.JsonWriter = .{ .w = w };
                 json.printSummary(&jw, &s) catch return exit_general;

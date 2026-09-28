@@ -108,6 +108,11 @@ Options:
   --help             Print help and exit
 ```
 
+A bare `git-weight` (no arguments) prints a dot heartbeat on stderr while the
+summary is computed, when stderr is a terminal. The dot line is ended before
+any report or error text, stdout is unchanged, and any explicit command or
+option (including `summary`) runs without it.
+
 ### Pack forensics
 
 `git-weight packs` reports per-pack delta statistics (delta count, max/mean chain depth, physical bytes stored for delta objects versus their logical size) plus a fragmentation summary — pack count, smallest/largest pack, and a one-line repack hint when the pack set looks suboptimal:
