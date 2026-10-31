@@ -203,8 +203,8 @@ fn run(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, errw: *std.I
                 report.comparison = .{
                     .base_revision = base_name,
                     .base_commit = base_commit,
-                    .base_points = base.total_points,
-                    .delta_points = @as(i128, @intCast(report.total_points)) - @as(i128, @intCast(base.total_points)),
+                    .base_points = base.metrics.total_points,
+                    .delta_points = @as(i128, @intCast(report.metrics.total_points)) - @as(i128, @intCast(base.metrics.total_points)),
                 };
             }
             if (opts.json) {
