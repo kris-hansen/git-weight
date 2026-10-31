@@ -5,12 +5,18 @@
 //!   wants(path_len) -> u32   io[0..path_len] = path; 1 if contents should be scored
 //!   addFile(path_len, len)   io = path ++ contents; returns 0 ok, 1 error
 //!   finish() -> u32          writes compact JSON result into io, returns its length
+//!   reserve(len) -> u32      grow io to hold at least len bytes (up to max_io); 1 ok, 0 refused.
+//!                            io may move: re-read ioPtr()/ioCapacity() after a successful call.
 const std = @import("std");
 const core = @import("complexity_core");
 const domain = core.domain;
 
 pub const io_capacity = 8 << 20;
-var io: [io_capacity]u8 = undefined;
+/// Largest single file the host may ask for (path ++ contents). The CLI has no per-file
+/// limit; this only bounds wasm memory. Larger files are reported by the host as skipped.
+pub const max_io = 64 << 20;
+var static_io: [io_capacity]u8 = undefined;
+var io: []u8 = &static_io;
 // Per-file scratch comes from linear memory grown on demand (memory.grow) and is
 // reset after every file, so peak memory tracks the largest file scored instead of
 // a fixed 64 MiB static buffer. wasm memory never shrinks, so the host should reuse
@@ -20,7 +26,16 @@ var prefix_buf: [256]u8 = undefined;
 var scanner: core.Scanner = .{};
 
 export fn ioPtr() [*]u8 {
-    return &io;
+    return io.ptr;
+}
+
+export fn reserve(len: u32) u32 {
+    if (len <= io.len) return 1;
+    if (len > max_io) return 0;
+    const grown = std.heap.wasm_allocator.alloc(u8, len) catch return 0;
+    if (io.ptr != &static_io) std.heap.wasm_allocator.free(io);
+    io = grown;
+    return 1;
 }
 
 /// Current linear memory size in bytes (for host-side monitoring).
@@ -29,7 +44,7 @@ export fn memoryBytes() u32 {
 }
 
 export fn ioCapacity() u32 {
-    return io_capacity;
+    return @intCast(io.len);
 }
 
 export fn begin(prefix_len: u32) void {
@@ -51,7 +66,7 @@ export fn addFile(path_len: u32, data_len: u32) u32 {
 
 export fn finish() u32 {
     const m = scanner.finish();
-    var w: std.Io.Writer = .fixed(&io);
+    var w: std.Io.Writer = .fixed(io);
     w.print("{{\"score_version\":\"{s}\"", .{core.score_version}) catch return 0;
     inline for (@typeInfo(core.Metrics).@"struct".fields) |f| {
         if (comptime std.mem.eql(u8, f.name, "domain_counts")) continue;
