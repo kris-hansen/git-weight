@@ -41,4 +41,23 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    // ReleaseSmall is ~17 KB; ReleaseFast is larger but ~2.7x less CPU per scanned byte.
+    const wasm_optimize = b.option(std.builtin.OptimizeMode, "wasm-optimize", "Optimize mode for the wasm step (default ReleaseSmall)") orelse .ReleaseSmall;
+    const wasm_module = b.createModule(.{
+        .root_source_file = b.path("src/wasm/complexity_wasm.zig"),
+        .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
+        .optimize = wasm_optimize,
+    });
+    wasm_module.addImport("complexity_core", b.createModule(.{
+        .root_source_file = b.path("src/analysis/core.zig"),
+        .target = wasm_module.resolved_target,
+        .optimize = wasm_optimize,
+    }));
+    const wasm = b.addExecutable(.{ .name = "git-weight-complexity", .root_module = wasm_module });
+    wasm.entry = .disabled;
+    wasm.rdynamic = true;
+    const install_wasm = b.addInstallArtifact(wasm, .{});
+    const wasm_step = b.step("wasm", "Build the complexity core as wasm32-freestanding");
+    wasm_step.dependOn(&install_wasm.step);
 }
