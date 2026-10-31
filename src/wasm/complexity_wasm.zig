@@ -11,12 +11,21 @@ const domain = core.domain;
 
 pub const io_capacity = 8 << 20;
 var io: [io_capacity]u8 = undefined;
-var scratch: [64 << 20]u8 = undefined;
+// Per-file scratch comes from linear memory grown on demand (memory.grow) and is
+// reset after every file, so peak memory tracks the largest file scored instead of
+// a fixed 64 MiB static buffer. wasm memory never shrinks, so the host should reuse
+// one instance across scans (begin() resets all scan state).
+var arena: std.heap.ArenaAllocator = .init(std.heap.wasm_allocator);
 var prefix_buf: [256]u8 = undefined;
 var scanner: core.Scanner = .{};
 
 export fn ioPtr() [*]u8 {
     return &io;
+}
+
+/// Current linear memory size in bytes (for host-side monitoring).
+export fn memoryBytes() u32 {
+    return @intCast(@wasmMemorySize(0) * std.wasm.page_size);
 }
 
 export fn ioCapacity() u32 {
@@ -35,8 +44,8 @@ export fn wants(path_len: u32) u32 {
 
 export fn addFile(path_len: u32, data_len: u32) u32 {
     if (@as(usize, path_len) + data_len > io.len) return 1;
-    var fba = std.heap.FixedBufferAllocator.init(&scratch);
-    scanner.addFile(fba.allocator(), io[0..path_len], io[path_len .. path_len + data_len]) catch return 1;
+    defer _ = arena.reset(.retain_capacity);
+    scanner.addFile(arena.allocator(), io[0..path_len], io[path_len .. path_len + data_len]) catch return 1;
     return 0;
 }
 
