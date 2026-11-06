@@ -67,7 +67,7 @@ jobs:
 
       - name: Install pinned git-weight release
         env:
-          VERSION: v0.7.1
+          VERSION: v0.7.3
         run: |
           set -euo pipefail
           base="https://github.com/kris-hansen/git-weight/releases/download/${VERSION}"
@@ -82,7 +82,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/bin"
           install -m 0755 "$RUNNER_TEMP/git-weight" "$RUNNER_TEMP/bin/git-weight"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
-          git-weight --version
+          "$RUNNER_TEMP/bin/git-weight" --version
 
       - name: Score proposed PR
         if: github.event_name == 'pull_request'
@@ -148,7 +148,7 @@ pruned. The CLI does not fetch GitHub PR metadata itself.
 `total_points` exceeds `N`. Start by observing and calibrating against your own
 history. Static signals cannot tell whether complexity is justified; reviewers
 must make that judgment. `git-weight complexity` has no threshold flag in
-v0.7.1; evaluate its JSON externally if you want a repository-level policy.
+v0.7.3; evaluate its JSON externally if you want a repository-level policy.
 
 See the [scoring formulas and limitations](../README.md#pr-complexity-experimental)
 in the README. The scores are proxies for observable code properties, not
